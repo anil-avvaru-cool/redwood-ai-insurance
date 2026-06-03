@@ -1,5 +1,5 @@
 # Feature Store Implementation Guide
-### Smart Oak Insurance — AI Platform
+### Redwood AI Insurance — AI Platform
 > Version: 2026-Q2 | Platform: Claims + Underwriting
 
 ---

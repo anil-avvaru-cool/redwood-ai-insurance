@@ -1,6 +1,6 @@
 
 # Data Generation Implementation Guide
-### Smart Oak Insurance — AI Platform
+### Redwood AI Insurance — AI Platform
 > Version: 2026-Q2 | Target: 20K quotes + 20K claims | Features: 20 per platform
 
 ---
