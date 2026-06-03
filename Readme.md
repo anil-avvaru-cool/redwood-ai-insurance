@@ -62,13 +62,13 @@ Customer requests quote                  Accident happens
 
 ## Platform Repositories
 
-| Repo | Description | Resume Signal |
+| Repo | Description | Focus Area |
 |---|---|---|
-| [insurance-data-platform](https://github.com/<username>/insurance-data-platform) | Entity resolution, feature store, synthetic data generation | Production data architecture, Decision Log |
-| [ai-fraud-detection-platform](https://github.com/<username>/ai-fraud-detection-platform) | Ensemble fraud scoring, graph intelligence, sync/async inference | ML systems design, adversarial framing |
-| [intelligent-underwriting-platform](https://github.com/<username>/intelligent-underwriting-platform) | Hurdle model risk scoring, quote generation agent | Actuarial ML, risk modeling |
-| [fnol-claims-multi-agent-system](https://github.com/<username>/fnol-claims-multi-agent-system) | FNOL Agent, Document Verification, Subrogation, Investigator Copilot | Agentic AI, HITL workflows |
-| [enterprise-rag-platform](https://github.com/<username>/enterprise-rag-platform) | Reusable RAG library consumed by both underwriting and claims agents | RAG architecture, document AI |
+| [insurance-data-platform](https://github.com/anil-avvaru-cool/insurance-data-platform) | Entity resolution, feature store, synthetic data generation | Production data architecture, Decision Log |
+| [ai-fraud-detection-platform](https://github.com/anil-avvaru-cool/ai-fraud-detection-platform) | Ensemble fraud scoring, graph intelligence, sync/async inference | ML systems design, adversarial framing |
+| [intelligent-underwriting-platform](https://github.com/anil-avvaru-cool/intelligent-underwriting-platform) | Hurdle model risk scoring, quote generation agent | Actuarial ML, risk modeling |
+| [fnol-claims-multi-agent-system](https://github.com/anil-avvaru-cool/fnol-claims-multi-agent-system) | FNOL Agent, Document Verification, Subrogation, Investigator Copilot | Agentic AI, HITL workflows |
+| [enterprise-rag-platform](https://github.com/anil-avvaru-cool/enterprise-rag-platform) | Reusable RAG library consumed by both underwriting and claims agents | RAG architecture, document AI |
 
 ---
 
@@ -134,9 +134,11 @@ In active development — 2026 Q2.
 
 ## Related Content
 
+Article published
+https://anilavvaru.substack.com/p/your-fraud-labels-are-lying-to-you
+
 Articles in progress — publishing on Towards Data Science and LinkedIn:
 
-- "Why fraud detection is not a classification problem" — contrarian, technically deep
 - "How we built a under 100ms fraud scorer on AWS" — concrete, deployable
 - "What C-suite gets wrong about claims AI" — executive reach
 
