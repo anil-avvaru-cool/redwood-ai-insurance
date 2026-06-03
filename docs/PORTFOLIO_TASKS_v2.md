@@ -7,7 +7,7 @@
 ## Repo Structure
 
 ```
-github.com/<username>/
+github.com/anil-avvaru-cool/
 ├── redwood-ai-insurance                  ← platform umbrella (parent, no code)
 ├── ai-fraud-detection-platform
 ├── intelligent-underwriting-platform
@@ -91,7 +91,7 @@ github.com/<username>/
 ## README Template (all child repos)
 
 ```markdown
-> **Part of the [Redwood AI Insurance Platform](https://github.com/<username>/redwood-ai-insurance)**
+> **Part of the [Redwood AI Insurance Platform](https://github.com/anil-avvaru-cool/redwood-ai-insurance)**
 > — an end-to-end intelligent insurance operations platform spanning underwriting through claims settlement.
 
 ## Overview

@@ -93,7 +93,7 @@ Vehicle, Person, Address, and Phone are resolved before the graph is built.
 A shares_address edge between two unnormalized strings is unreliable and degrades
 Louvain community detection silently.
 
-Full decision log with all 13 entries: [insurance-data-platform/DECISION_LOG.md](https://github.com/<username>/insurance-data-platform/blob/main/DECISION_LOG.md)
+Full decision log with all 13 entries: [insurance-data-platform/DECISION_LOG.md](https://github.com/anil-avvaru-cool/insurance-data-platform/blob/main/DECISION_LOG.md)
 
 ---
 
