@@ -1,6 +1,6 @@
 # Redwood AI Insurance — Portfolio Task List
 > Priority order: portfolio first, meetup later.
-> Repo structure: `github.com/<username>/` personal namespace.
+> Repo structure: `github.com/anil-avvaru-cool/` personal namespace.
 
 ---
 
