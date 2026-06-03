@@ -25,6 +25,7 @@ github.com/anil-avvaru-cool/
 - [ ] Write platform README with full Redwood AI Insurance story — overview, architecture summary, links to all 5 child repos
 - [ ] Create platform architecture diagram — all 6 components connected through the shared data spine
 - [ ] Add STRATEGY.md and key architecture docs to umbrella repo
+- [ ] Port DECISION_LOG.md (DEC-001 to DEC-013) into umbrella repo — shows production reasoning, not just code
 - [ ] Create all 5 child repos with "Part of Redwood AI Insurance Platform" banner linking back to umbrella
 
 ---
@@ -36,7 +37,6 @@ github.com/anil-avvaru-cool/
 
 - [ ] Write README with entity resolution + feature store overview — explain why entity resolution is Layer 0
 - [ ] Add architecture diagram: 7-layer build order (config → archetypes → generator → entities → graph → features → models)
-- [ ] Port DECISION_LOG.md (DEC-001 to DEC-013) into repo — shows production reasoning, not just code
 - [ ] Add roadmap with concrete week-by-week milestones — signals active development, not a graveyard
 
 ---
