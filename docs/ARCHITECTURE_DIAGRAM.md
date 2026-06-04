@@ -1,6 +1,8 @@
 # Platform Architecture Diagram
 
 ---
+![Redwood platform data flow](https://raw.githubusercontent.com/anil-avvaru-cool/redwood-ai-insurance/refs/heads/main/docs/Architecture/redwood_platform_data_flow.svg)
+
 ![Redwood Decision Tiers](https://raw.githubusercontent.com/anil-avvaru-cool/redwood-ai-insurance/refs/heads/main/docs/Architecture/redwood_decision_tiers.svg)
 
 
