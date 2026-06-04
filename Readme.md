@@ -30,7 +30,7 @@ graph intelligence, behavioral analytics, and human investigation workflows.
 
 ---
 
-## Architecture
+## Platform Architecture
 
 ```
 UNDERWRITING PLATFORM                    CLAIMS PLATFORM
@@ -58,9 +58,44 @@ Customer requests quote                  Accident happens
                   resolved once, consumed by both platforms
 ```
 
+### Data Flow
+
+```
+Customer / Claimant
+        │
+        ▼
+┌───────────────────┐
+│  Entity Resolution│  ← VIN decode, address normalize, person dedup
+│   (Layer 0)       │    Runs once offline. Both platforms consume.
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│   Feature Store   │  ← Versioned. Immutable snapshots. Sub-10ms online serving.
+│  (Online + Offline│    State regulatory mask applied here (not at model level).
+└────────┬──────────┘
+         │
+    ┌────┴─────┐
+    ▼          ▼
+Underwriting  Claims
+ Platform    Platform
+    │          │
+    │   risk_score_at_issuance
+    └────────► │  (shared data spine: underwriting → fraud detection)
+               ▼
+         Fraud Score
+         [0.0 – 1.0]
+               │
+         ┌─────┴──────┐
+         ▼            ▼
+     STP (auto)   SIU Referral /
+                  Investigator
+                    Copilot
+```
+
 ---
 
-## Platform Repositories
+## Repositories
 
 | Repo | Description | Focus Area |
 |---|---|---|
@@ -69,31 +104,6 @@ Customer requests quote                  Accident happens
 | [intelligent-underwriting-platform](https://github.com/anil-avvaru-cool/intelligent-underwriting-platform) | Hurdle model risk scoring, quote generation agent | Actuarial ML, risk modeling |
 | [fnol-claims-multi-agent-system](https://github.com/anil-avvaru-cool/fnol-claims-multi-agent-system) | FNOL Agent, Document Verification, Subrogation, Investigator Copilot | Agentic AI, HITL workflows |
 | [enterprise-rag-platform](https://github.com/anil-avvaru-cool/enterprise-rag-platform) | Reusable RAG library consumed by both underwriting and claims agents | RAG architecture, document AI |
-
----
-
-## Key Design Decisions
-
-This platform was built with explicit, documented reasoning at every architectural
-junction. Selected decisions that shaped the design:
-
-**DEC-004 — feature_definitions.py as Layer 0**
-Training-serving skew is the most common silent failure mode in production ML.
-Making feature definitions the dependency root — not an output of data generation —
-forces both pipelines to share one implementation from day one.
-
-**DEC-010 — risk_score_at_issuance as fraud feature**
-The underwriting risk score is stored in the feature store and re-used as a fraud
-scoring input, not discarded after policy issuance. This is the architectural
-"shared data spine" — risk score is not a claims pipeline stage, it re-enters
-claims as a feature.
-
-**DEC-011 — Entity resolution as independent pre-graph layer**
-Vehicle, Person, Address, and Phone are resolved before the graph is built.
-A shares_address edge between two unnormalized strings is unreliable and degrades
-Louvain community detection silently.
-
-Full decision log with all 13 entries: [redwood-ai-insurance/DECISION_LOG.md](https://github.com/anil-avvaru-cool/redwood-ai-insurance/blob/main/docs/DECISION_LOG.md)
 
 ---
 
@@ -115,6 +125,42 @@ Full decision log with all 13 entries: [redwood-ai-insurance/DECISION_LOG.md](ht
 
 ---
 
+## Key Design Decisions
+
+This platform was built with explicit, documented reasoning at every architectural
+junction. The full Decision Log is in [`docs/DECISION_LOG.md`](./docs/DECISION_LOG.md).
+Selected decisions that shaped the design:
+
+**[DEC-001](./docs/DECISION_LOG.md#dec-001----telematics-nulls-null-not-default) — Telematics nulls: null, not default**
+XGBoost's native missing-value handling learns the actual risk distribution for
+non-telematics users. Non-telematics users skew slightly higher risk on average
+due to adverse selection — imputing a neutral value masks this signal for 60% of
+the user base.
+
+**[DEC-004](./docs/DECISION_LOG.md#dec-004----feature_definitionspy-as-layer-0) — `feature_definitions.py` as Layer 0**
+Training-serving skew is the most common silent failure mode in production ML.
+Making feature definitions the dependency root forces both pipelines to share one
+implementation from day one. Archetypes import feature names from
+`feature_definitions.py` — never the reverse.
+
+**[DEC-010](./docs/DECISION_LOG.md#dec-010----risk_score_at_issuance-as-fraud-feature-shared-spine) — `risk_score_at_issuance` as fraud feature**
+The underwriting risk score is stored in the feature store and re-used as a fraud
+scoring input at FNOL time. This is the "shared data spine" — a high-risk policy
+filed shortly after issuance is one of the strongest fraud signals in personal auto.
+
+**[DEC-011](./docs/DECISION_LOG.md#dec-011----entity-resolution-as-independent-pre-graph-layer) — Entity resolution as independent pre-graph layer**
+Vehicle, Person, Address, and Phone are resolved before the graph is built. A
+`shares_address` edge between two unnormalized strings degrades Louvain community
+detection silently — fraud rings appear disconnected.
+
+**[DEC-013](./docs/DECISION_LOG.md#dec-013----source-datetimes-in-raw-parquet-derived-ints-unchanged-in-feature-store-option-a) — Source datetimes in raw parquet; derived ints unchanged in feature store**
+Source datetime columns (`fnol_submitted_at`, `quote_requested_at`) live in raw
+parquet only — consumed by `psi_drift.py` for drift monitoring. Derived int
+features (`reporting_delay_days`, `policy_inception_days`) remain unchanged in
+the feature vector and trained artifacts. Non-breaking. No model retraining required.
+
+---
+
 ## Platform Status
 
 In active development — 2026 Q2.
@@ -132,15 +178,11 @@ In active development — 2026 Q2.
 
 ---
 
-## Related Content
+## Related Writing
 
-Article published
-https://anilavvaru.substack.com/p/your-fraud-labels-are-lying-to-you
-
-Articles in progress — publishing on Towards Data Science and LinkedIn:
-
-- "How we built a under 100ms fraud scorer on AWS" — concrete, deployable
-- "What C-suite gets wrong about claims AI" — executive reach
+- [Your Fraud Labels Are Lying to You](https://anilavvaru.substack.com/p/your-fraud-labels-are-lying-to-you) — published
+- "How we built a sub-100ms fraud scorer on AWS" — in progress
+- "What C-suite gets wrong about claims AI" — in progress
 
 ---
 
