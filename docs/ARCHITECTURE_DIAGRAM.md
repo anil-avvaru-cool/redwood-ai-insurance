@@ -1,48 +1,48 @@
-# Platform Architecture Diagram
+# Platform Architecture Diagrams
+### Redwood AI Insurance — AI Platform
+
+The platform architecture is split into two focused diagrams. Each is a standalone SVG — embed directly in any markdown renderer that supports inline SVG, or reference as a separate `.svg` file.
 
 ---
+
+## Diagram 1 — Platform data flow
+
+Shows the full top-down data flow: entity resolution → feature store → underwriting and claims platforms in parallel → shared data spine → HITL feedback loop.
+
 ![Redwood platform data flow](https://raw.githubusercontent.com/anil-avvaru-cool/redwood-ai-insurance/refs/heads/main/docs/Architecture/redwood_platform_data_flow.svg)
+
+---
+
+## Diagram 2 — Decision tiers and inference paths
+
+Shows what happens after the fraud score is produced: the four risk-tier routing outcomes, and the sync vs async inference split with component-level latency budgets.
 
 ![Redwood Decision Tiers](https://raw.githubusercontent.com/anil-avvaru-cool/redwood-ai-insurance/refs/heads/main/docs/Architecture/redwood_decision_tiers.svg)
 
+---
 
-> **Full interactive SVG available in the platform repository.**
-> See `docs/architecture/redwood_platform_data_flow.svg` `docs/architecture/redwood_decision_tiers.svg`.
+## Reading the diagrams
+
+### Diagram 1 — data flow tiers
+
+| Row | What it represents |
+|---|---|
+| Entity resolution | Runs once offline before any pipeline. Outputs resolved vehicles, persons, addresses, and policies to `data/entities/`. |
+| Feature store | Single source of truth for all model inputs. State regulatory mask applied here — credit score set to null for CA/MA/MI/HI before the vector is assembled. Source datetimes live in raw parquet only (DEC-013). |
+| Underwriting column (left) | Risk scoring → quote agent → policy issuance. `risk_score_at_issuance` written to feature store at quote completion. |
+| Claims column (right) | FNOL agent → ensemble fraud scoring → decision orchestration. Reads `risk_score_at_issuance` from feature store at FNOL time. |
+| Shared data spine (dashed amber) | The architectural link from DEC-010. A high-risk policy filed shortly after issuance is one of the strongest fraud signals in personal auto — without this link it is invisible to the fraud model. |
+| Feedback loop (dashed gray, left margin) | Investigator decisions flow into the label store. Confirmed fraud labels (keyed on `fraud_confirmed_at`) trigger retraining eligibility. Override patterns surface model blind spots. |
+
+### Diagram 2 — decision tiers and inference paths
+
+| Section | What it represents |
+|---|---|
+| Four tier boxes | Score-based routing after the ensemble meta-learner produces its output. Thresholds are calibrated to minimize expected dollar loss, not accuracy. |
+| Sync path (<100ms) | Blocks FNOL submission. Redis lookup + device check + 1–2 hop graph query + XGBoost score + routing ≈ 65ms total. Entity resolution is a pre-computation step — it does not run inside this latency budget. |
+| Async path (seconds–minutes) | Post-submission enrichment. Deep ViT analysis, full 3+ hop graph traversal, LLM narrative reconciliation, third-party data (MVR, credit, LexisNexis). |
+| Async re-score note | If the async path materially raises the score above the sync score, the claim is automatically re-evaluated and can escalate to a higher tier. |
 
 ---
 
-## Reading the Diagram
-
-The architecture has four horizontal tiers:
-
-1. **Entity Resolution (Stage 0)** — runs once offline before any model or pipeline.
-   Outputs resolved vehicles, persons, addresses, and policies to `data/entities/`.
-
-2. **Feature Store** — the single source of truth for all model inputs. State
-   regulatory mask applied here. Source datetimes in raw parquet only; derived ints
-   in feature vector (DEC-013).
-
-3. **Platform columns** — Underwriting (left) and Claims (right) run in parallel,
-   both consuming from the shared feature store.
-
-4. **Decision outcomes** — STP auto-approve, evidence request, SIU referral, and
-   Investigator Copilot HITL. A feedback loop from the label store flows back into
-   retraining.
-
-### Shared Data Spine
-
-The dashed amber arrow from **Policy Issuance → Fraud Scoring** carries
-`risk_score_at_issuance`. This is the architectural "shared spine" described in
-DEC-010: the underwriting risk score re-enters the claims pipeline as a fraud
-feature. Without it, the fraud model has no knowledge of the underwriting context
-at the time the policy was issued.
-
-### Inference Paths
-
-**Synchronous (<100ms):** Online feature retrieval (Redis) → device lookup → graph
-neighborhood query → tabular XGBoost → decision orchestration.
-
-**Asynchronous (seconds–minutes):** Deep ViT image analysis → full graph traversal
-→ LLM narrative reconciliation → third-party enrichment → score update.
-
-See `Fraud_Detection_Architecture.md` §7 for per-component latency budgets.
+*Diagram version: 2026-Q2*
