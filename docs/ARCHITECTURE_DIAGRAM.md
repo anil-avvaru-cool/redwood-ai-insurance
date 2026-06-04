@@ -1,6 +1,8 @@
 # Platform Architecture Diagram
 
 ---
+![Redwood Decision Tiers](https://raw.githubusercontent.com/anil-avvaru-cool/redwood-ai-insurance/refs/heads/main/docs/Architecture/redwood_decision_tiers.svg)
+
 
 > **Full interactive SVG available in the platform repository.**
 > See `docs/architecture/redwood_platform_data_flow.svg` `docs/architecture/redwood_decision_tiers.svg`.
