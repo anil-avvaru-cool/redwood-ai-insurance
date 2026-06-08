@@ -1,0 +1,198 @@
+# Platform-wide Docker Compose — run from redwood-ai-insurance/
+#
+# Requires all repos cloned as siblings under the same parent directory.
+# See docs/Local_setup.md for the expected directory layout.
+#
+# Usage:
+#   docker compose up                          # shared infra only (Redis + Neo4j)
+#   docker compose --profile data up           # insurance-data-platform + infra
+#   docker compose --profile underwriting up   # intelligent-underwriting-platform + infra
+#   docker compose --profile fraud up          # ai-fraud-detection-platform + infra
+#   docker compose --profile rag up            # enterprise-rag-platform + infra
+#   docker compose --profile fnol up           # fnol + rag + infra
+#   docker compose --profile all up            # every service
+#
+# Note: underwriting, fraud, fnol, and rag services require Dockerfiles to be
+# added to their respective repos before their profiles can be used.
+
+services:
+
+  # ── Shared infrastructure ─────────────────────────────────────────────────
+
+  redis:
+    image: redis:7.2
+    ports:
+      - "6379:6379"
+    networks:
+      - platform-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5.11
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_server_bolt_advertised__address: neo4j:7687
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "MATCH () RETURN count(*) limit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - platform-network
+
+  # ── insurance-data-platform ───────────────────────────────────────────────
+
+  data-platform:
+    profiles: [data, all]
+    build:
+      context: ../insurance-data-platform
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ../insurance-data-platform:/app
+    environment:
+      REDIS_URL: "${REDIS_URL}"
+      NEO4J_URI: "${NEO4J_URI}"
+      NEO4J_USER: "${NEO4J_USER}"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      HOME: /tmp
+    networks:
+      - platform-network
+
+  # ── intelligent-underwriting-platform ─────────────────────────────────────
+  # Requires: ../intelligent-underwriting-platform/Dockerfile
+
+  underwriting:
+    profiles: [underwriting, all]
+    build:
+      context: ../intelligent-underwriting-platform
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ../intelligent-underwriting-platform:/app
+      - ../insurance-data-platform/data:/data/insurance:ro
+    environment:
+      REDIS_URL: "${REDIS_URL}"
+      NEO4J_URI: "${NEO4J_URI}"
+      NEO4J_USER: "${NEO4J_USER}"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      DATA_PLATFORM_ROOT: /data/insurance
+      API_HOST: "0.0.0.0"
+      API_PORT: "8001"
+    ports:
+      - "8001:8001"
+    networks:
+      - platform-network
+
+  # ── ai-fraud-detection-platform ───────────────────────────────────────────
+  # Requires: ../ai-fraud-detection-platform/Dockerfile
+
+  fraud:
+    profiles: [fraud, all]
+    build:
+      context: ../ai-fraud-detection-platform
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ../ai-fraud-detection-platform:/app
+      - ../insurance-data-platform/data:/data/insurance:ro
+    environment:
+      REDIS_URL: "${REDIS_URL}"
+      NEO4J_URI: "${NEO4J_URI}"
+      NEO4J_USER: "${NEO4J_USER}"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      DATA_PLATFORM_ROOT: /data/insurance
+      API_HOST: "0.0.0.0"
+      API_PORT: "8002"
+    ports:
+      - "8002:8002"
+    networks:
+      - platform-network
+
+  # ── enterprise-rag-platform ───────────────────────────────────────────────
+  # Requires: ../enterprise-rag-platform/Dockerfile
+  # Included automatically with --profile fnol (FNOL depends on RAG)
+
+  rag:
+    profiles: [rag, fnol, all]
+    build:
+      context: ../enterprise-rag-platform
+    volumes:
+      - ../enterprise-rag-platform:/app
+      - rag_docs:/data/rag/documents
+    environment:
+      EMBEDDER_BACKEND: "${EMBEDDER_BACKEND:-local-st}"
+      VECTOR_STORE_BACKEND: "${VECTOR_STORE_BACKEND:-faiss}"
+      EMBEDDING_CACHE_BACKEND: "${EMBEDDING_CACHE_BACKEND:-in-memory}"
+      INGEST_DOCS_ROOT: "${INGEST_DOCS_ROOT:-/data/rag/documents}"
+      FAISS_INDEX_PATH: "${FAISS_INDEX_PATH:-/tmp/rag/faiss.index}"
+      BM25_INDEX_PATH: "${BM25_INDEX_PATH:-/tmp/rag/bm25.index}"
+      RERANKER_BACKEND: "${RERANKER_BACKEND:-local-ce}"
+      BEDROCK_REGION: "${BEDROCK_REGION:-us-east-1}"
+    ports:
+      - "8003:8003"
+    networks:
+      - platform-network
+
+  # ── fnol-claims-multi-agent-system ────────────────────────────────────────
+  # Requires: ../fnol-claims-multi-agent-system/Dockerfile
+  # Automatically starts the rag service as a dependency.
+
+  fnol:
+    profiles: [fnol, all]
+    build:
+      context: ../fnol-claims-multi-agent-system
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      rag:
+        condition: service_started
+    volumes:
+      - ../fnol-claims-multi-agent-system:/app
+    environment:
+      REDIS_URL: "${REDIS_URL}"
+      NEO4J_URI: "${NEO4J_URI}"
+      NEO4J_USER: "${NEO4J_USER}"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      FRAUD_SCORING_URL: "http://fraud:8002"
+      RAG_URL: "http://rag:8003"
+      S3_LABEL_BUCKET: "${S3_LABEL_BUCKET:-fnol-labels}"
+      ENV: "${ENV:-dev}"
+    ports:
+      - "8000:8000"
+    networks:
+      - platform-network
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  rag_docs:
+
+networks:
+  platform-network:
+    driver: bridge

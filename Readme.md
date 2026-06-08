@@ -4,6 +4,8 @@
 > from quote generation through claims settlement — through risk scoring,
 > real-time fraud detection, and autonomous claims automation.
 
+**[Local setup →](docs/Local_setup.md)** | **Prerequisites:** Python 3.11+, Docker, UV
+
 ---
 
 ## Platform Overview
@@ -167,14 +169,15 @@ In active development — 2026 Q2.
 
 | Component | Status |
 |---|---|
-| Entity resolution layer | 🔨 In progress |
-| Synthetic data generator | 🔨 In progress |
-| Feature store | 🔨 In progress |
-| Risk scoring (hurdle model) | 📋 Planned — Week 3 |
-| Fraud scoring (ensemble) | 📋 Planned — Week 4 |
-| FNOL Agent | 📋 Planned — Week 5 |
-| Claims automation | 📋 Planned — Week 6 |
-| AWS deployment | 📋 Planned — Week 7 |
+| Entity resolution layer | ✅ Complete |
+| Synthetic data generator | ✅ Complete |
+| Feature store | ✅ Complete |
+| Risk scoring (hurdle model) | ✅ Complete |
+| Fraud scoring (ensemble) | ✅ Complete |
+| FNOL Agent | ✅ Complete |
+| Claims automation | ✅ Complete |
+| RAG library | ✅ Complete |
+| AWS deployment | 📋 Planned — 2026 Q3 |
 
 ---
 
