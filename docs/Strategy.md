@@ -180,6 +180,26 @@ held-out production sample, not on synthetic data. See DEC-007.
 
 ---
 
+## Deployment Topology
+
+The platform components are fixed. The deployment topology varies by customer constraint.
+
+Every customer engagement starts with three questions before any technology is selected:
+
+1. **Can LLM inference traffic leave the customer network?** Regulated carriers (DOI consent orders, NFIP, state-run funds) require air-gapped vLLM. Cloud-native carriers use Bedrock or Azure OpenAI. The answer to this question alone determines 80% of the infrastructure selection.
+
+2. **What is the existing infrastructure substrate?** AWS-committed carriers get EKS + KServe + ElastiCache. Azure-committed carriers get AKS + Azure Cache. Carriers with an existing OpenShift contract get RHOAI + KServe built-in. SI engagements inherit the client's substrate. Greenfield defaults to EKS.
+
+3. **What is the regulatory and audit posture?** DOI filing exposure requires full MLflow lineage, immutable feature snapshots, and KServe InferenceService versioning. Internal tooling deployments can use a simplified configuration.
+
+The platform exposes three substrate bindings — AWS, Azure, OpenShift — via Helm values files. Core platform logic has no substrate imports. Substrate bindings are isolated to `values-*.yaml` and operator manifests.
+
+**Non-negotiable portability constraint:** All LLM calls in `enterprise-rag-platform` and `fnol-claims-multi-agent-system` go through a single OpenAI-compatible endpoint configured in `enterprise-rag-platform/config.py`. No direct cloud-provider SDK calls anywhere in agent or RAG code. Swapping Bedrock for vLLM is a config change, not a code change.
+
+**Implementation:** `enterprise-rag-platform/config.py` (LLM substrate config), `redwood-ai-insurance/helm/` (three values files). See [DEC-014](./DECISION_LOG.md#dec-014----deployment-topology-as-a-first-class-decision) and [DEPLOYMENT_TOPOLOGIES.md](./DEPLOYMENT_TOPOLOGIES.md).
+
+---
+
 ## What This Platform Is Not
 
 - Not a single model solving a single classification task.

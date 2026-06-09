@@ -186,3 +186,24 @@ Each entry captures:
 **Trade-off accepted:** `policy_inception_days` and `reporting_delay_days` have two representations. The derivation relationship must be kept in sync in `feature_definitions.py`.
 
 **Applies to:** `generator.py`, `archetypes_claims.py`, `archetypes_underwriting.py`, `entity_policy.py`, `hurdle_model.py`, `validator.py`, `feature_definitions.py`, `monitoring/psi_drift.py`.
+
+---
+
+## DEC-014 — Deployment Topology as a First-Class Decision
+
+**Date:** 2026-Q2
+
+**Decision:** Deployment topology is segment-driven, not stack-driven. The platform exposes three substrate bindings (AWS, Azure, OpenShift) via Helm values files. Component implementations are substrate-agnostic. LLM substrate is abstracted behind an OpenAI-compatible interface in `enterprise-rag-platform`.
+
+**Rationale:** A single deployment target would disqualify Redwood from regulated carrier and SI delivery engagements where infrastructure is either dictated by compliance posture or by an existing enterprise contract. The three-binding approach covers the full commercial carrier market without platform fragmentation.
+
+**Agent framework selection by segment:**
+- **LangGraph** — default for all segments. No cloud dependency, state machine model maps directly to claim lifecycle states, portable across all three substrate bindings.
+- **CrewAI** — available for insurtech and mid-market segments where rapid prototyping speed outweighs operational control. Not recommended for regulated deployments.
+- **vLLM** — LLM serving layer for any deployment where inference traffic cannot leave the customer network. Exposes OpenAI-compatible API — no application code changes when switching from managed API to vLLM.
+
+**Alternative considered:** A single AWS-only deployment target. Rejected — excludes regulated carriers under DOI consent orders and SI engagements with existing OpenShift contracts.
+
+**Trade-off accepted:** Three values files require maintenance when platform components change. Mitigated by the portability map in `DEPLOYMENT_TOPOLOGIES.md` — substrate bindings are isolated to `values-*.yaml` and operator manifests. Core platform logic has no substrate imports.
+
+**Applies to:** `redwood-ai-insurance/helm/`, `redwood-ai-insurance/openshift/`, `enterprise-rag-platform/config.py`, `fnol-claims-multi-agent-system/`, `DEPLOYMENT_TOPOLOGIES.md`.

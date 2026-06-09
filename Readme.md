@@ -111,19 +111,24 @@ Underwriting  Claims
 
 ## Technology Stack
 
-| Layer | Technology |
-|---|---|
-| Tabular scoring | XGBoost, LightGBM |
-| Graph intelligence | Neo4j / Amazon Neptune |
-| Online feature serving | Redis / ElastiCache |
-| Offline feature pipeline | Spark / AWS Glue |
-| Graph neural network | GraphSAGE |
-| NLP narrative analysis | Transformer (fine-tuned) |
-| Vision fraud detection | ViT / CLIP |
-| Explainability | SHAP |
-| API layer | FastAPI + AWS Lambda |
-| Agents | LLM-powered with RAG |
-| Drift monitoring | PSI / CSI |
+Deployment topology is segment-driven. The same platform components run on three infrastructure substrates — AWS, Azure, and OpenShift. See [docs/DEPLOYMENT_TOPOLOGIES.md](./docs/DEPLOYMENT_TOPOLOGIES.md) for the full segment decision matrix and per-component portability map.
+
+| Layer | AWS | Azure | OpenShift | Portable |
+|---|---|---|---|---|
+| Tabular scoring | XGBoost, LightGBM | XGBoost, LightGBM | XGBoost, LightGBM | Yes — pure Python |
+| Graph intelligence | Amazon Neptune | Cosmos DB (Gremlin) | Neo4j Operator on OCP | Cypher — Neptune and Neo4j both support |
+| Online feature serving | ElastiCache (Redis) | Azure Cache for Redis | Redis Operator on OCP | Redis — same API across all |
+| Offline feature pipeline | S3 + AWS Glue | ADLS + Synapse | ODF + Spark on RHOAI | Parquet + Spark |
+| Model serving | KServe on EKS | KServe on AKS | KServe on RHOAI | KServe InferenceService spec |
+| LLM inference | Bedrock Titan | Azure OpenAI | vLLM on GPU nodepool | OpenAI-compatible API |
+| Graph neural network | GraphSAGE | GraphSAGE | GraphSAGE | Yes |
+| NLP narrative analysis | Transformer (fine-tuned) | Transformer (fine-tuned) | Transformer (fine-tuned) | Yes |
+| Vision fraud detection | ViT / CLIP | ViT / CLIP | ViT / CLIP | Yes |
+| Explainability | SHAP | SHAP | SHAP | Yes |
+| API layer | FastAPI + AWS Lambda | FastAPI + Azure Functions | FastAPI on OCP | FastAPI |
+| Agent orchestration | LangGraph on EKS | LangGraph on AKS | LangGraph on OCP | LangGraph — no cloud dependency |
+| Drift monitoring | CloudWatch + PSI | Azure Monitor + PSI | Prometheus + Grafana | PSI — pure Python |
+| Audit trail | S3 + Athena | ADLS + Synapse | ODF + Trino | Parquet schema identical |
 
 ---
 
@@ -177,7 +182,7 @@ In active development — 2026 Q2.
 | FNOL Agent | ✅ Complete |
 | Claims automation | ✅ Complete |
 | RAG library | ✅ Complete |
-| AWS deployment | 📋 Planned — 2026 Q3 |
+| Cloud deployment (AWS / Azure / OpenShift) | 📋 Planned — 2026 Q3 |
 
 ---
 
