@@ -207,3 +207,28 @@ Each entry captures:
 **Trade-off accepted:** Three values files require maintenance when platform components change. Mitigated by the portability map in `DEPLOYMENT_TOPOLOGIES.md` — substrate bindings are isolated to `values-*.yaml` and operator manifests. Core platform logic has no substrate imports.
 
 **Applies to:** `redwood-ai-insurance/helm/`, `redwood-ai-insurance/openshift/`, `enterprise-rag-platform/config.py`, `fnol-claims-multi-agent-system/`, `DEPLOYMENT_TOPOLOGIES.md`.
+
+---
+
+## DEC-015 — LangChain as primitives layer alongside LangGraph
+
+**Date:** 2026-Q2
+**Decision:** LangChain is adopted as the primitives layer for LLM model wrappers, prompt templates, output parsers, and RAG retrieval. LangGraph is the orchestration layer. The two are used together with a strict module boundary: business logic and ML scoring modules have no LangChain dependency. Only agent nodes import LangChain.
+
+**Rationale:** LangGraph is built on LangChain — its nodes are LangChain `Runnable` instances. Using LangChain for model I/O and retrieval is the canonical integration and avoids writing bespoke wrappers for Bedrock, Azure OpenAI, and vLLM. The `enterprise-rag-platform` already exposes a LangChain `BaseRetriever` interface — reusing it prevents a second abstraction layer for document retrieval in FNOL and underwriting nodes.
+
+**Alternatives considered:**
+- **Raw Anthropic/OpenAI SDK calls inside nodes** — rejected. Each substrate (Bedrock, Azure OpenAI, vLLM) has a different API surface. `BaseChatModel` provides a single interface with substrate-specific implementations, which is required for the three-binding deployment model (DEC-014).
+- **LangChain `AgentExecutor` as orchestration** — rejected. Predates LangGraph. No HITL interrupt support, no checkpointing, opaque control flow incompatible with claim lifecycle state management.
+- **AutoGen (Microsoft)** — rejected. Conversation-centric model does not map to the state-machine claim lifecycle. No native graph checkpointing. Less portable across AWS / Azure / OpenShift substrates.
+- **CrewAI** — considered for rapid prototyping paths only (see DEC-014). Rejected for regulated carrier deployments — insufficient control over state transitions and no HITL interrupt primitive.
+
+**What NOT to use from LangChain (explicitly excluded):**
+- `AgentExecutor`, `initialize_agent` — replaced by LangGraph `StateGraph`
+- `ConversationalRetrievalChain`, `RetrievalQAChain`, `SequentialChain` — replaced by LCEL chains inside LangGraph nodes
+- LangChain built-in memory (`ConversationBufferMemory`, `ConversationSummaryMemory`) — replaced by LangGraph `TypedDict` state with `add_messages` reducer
+- `StructuredChatAgent`, `OpenAIFunctionsAgent` — replaced by LangGraph tool-calling nodes
+
+**Trade-off accepted:** LangChain has a large dependency footprint and ships breaking changes between minor versions. Pin to a specific version in `pyproject.toml`. The ML scoring path (XGBoost, feature store, Neo4j graph queries) must never import LangChain — enforced by module boundary and import linting.
+
+**Applies to:** `fnol-claims-multi-agent-system/`, `intelligent-underwriting-platform/` (quote agent), `enterprise-rag-platform/`.

@@ -45,4 +45,16 @@ Shows what happens after the fraud score is produced: the four risk-tier routing
 
 ---
 
+---
+
+## Related Architecture Documents
+
+| Document | Covers |
+|---|---|
+| [Multi_Agent_Architecture.md](./Multi_Agent_Architecture.md) | LangGraph StateGraph topology, state schemas, HITL interrupt pattern, checkpointing, LangChain integration |
+| [Fraud_Detection_Architecture.md](./Fraud_Detection_Architecture.md) | Ensemble fraud scoring, sync/async inference, investigator copilot |
+| [Risk_Scoring_Architecture.md](./Risk_Scoring_Architecture.md) | Hurdle model, feature store, calibration, drift monitoring |
+
+---
+
 *Diagram version: 2026-Q2*

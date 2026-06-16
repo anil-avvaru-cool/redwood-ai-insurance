@@ -127,6 +127,7 @@ Deployment topology is segment-driven. The same platform components run on three
 | Explainability | SHAP | SHAP | SHAP | Yes |
 | API layer | FastAPI + AWS Lambda | FastAPI + Azure Functions | FastAPI on OCP | FastAPI |
 | Agent orchestration | LangGraph on EKS | LangGraph on AKS | LangGraph on OCP | LangGraph — no cloud dependency |
+| Agent primitives | LangChain (Bedrock) | LangChain (AzureOpenAI) | LangChain (vLLM) | LangChain `BaseChatModel` — substrate-agnostic |
 | Drift monitoring | CloudWatch + PSI | Azure Monitor + PSI | Prometheus + Grafana | PSI — pure Python |
 | Audit trail | S3 + Athena | ADLS + Synapse | ODF + Trino | Parquet schema identical |
 
@@ -165,6 +166,12 @@ Source datetime columns (`fnol_submitted_at`, `quote_requested_at`) live in raw
 parquet only — consumed by `psi_drift.py` for drift monitoring. Derived int
 features (`reporting_delay_days`, `policy_inception_days`) remain unchanged in
 the feature vector and trained artifacts. Non-breaking. No model retraining required.
+
+**[DEC-014](./docs/DECISION_LOG.md#dec-014----deployment-topology-as-a-first-class-decision) — Deployment topology as a first-class decision**
+LangGraph is the default agent orchestration layer across all three substrate bindings (AWS / Azure / OpenShift). No cloud dependency — the same `StateGraph` runs everywhere.
+
+**[DEC-015](./docs/DECISION_LOG.md#dec-015----langchain-as-primitives-layer-alongside-langgraph) — LangChain as primitives layer alongside LangGraph**
+LangChain provides model wrappers, prompt templates, output parsers, and RAG retrieval inside agent nodes. Hard module boundary: ML scoring and feature store modules have no LangChain dependency. See [Multi_Agent_Architecture.md](./docs/Multi_Agent_Architecture.md) for full graph topology, state schemas, and HITL patterns.
 
 ---
 
