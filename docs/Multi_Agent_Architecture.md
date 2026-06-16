@@ -14,6 +14,8 @@
 ## Table of Contents
 1. [Layer Separation](#1-layer-separation)
 2. [FNOL Multi-Agent System](#2-fnol-multi-agent-system)
+   - [2c. DocumentVerification Graph](#2c-documentverification-graph)
+   - [2d. Subrogation Graph](#2d-subrogation-graph)
 3. [Underwriting Quote Agent](#3-underwriting-quote-agent)
 4. [State Schema Design](#4-state-schema-design)
 5. [HITL Interrupt Pattern](#5-hitl-interrupt-pattern)
@@ -174,6 +176,176 @@ def route_by_score(state: FNOLState) -> str:
 
 Thresholds are configured in `config.py` — not hardcoded in the graph.
 They are calibrated to minimize expected dollar loss, not maximize accuracy.
+
+---
+
+### 2c. DocumentVerification Graph
+
+**Lifecycle:** Async. Triggered at `audit_node` completion — same trigger point as the existing async FNOL path. Runs as a separate async job (SQS / Azure Service Bus / OCP Job).
+**Thread ID:** `doc_verify_{claim_id}` — isolated from the FNOL graph's `claim_id` checkpoint to prevent key collision.
+**State source:** Reads claim context from the claim store directly, not from the FNOL LangGraph checkpoint. Keeps this graph decoupled from FNOL graph internals.
+
+```
+Document Submission Event
+(claim_id + document_refs — emitted at audit_node completion)
+      │
+      ▼
+┌──────────────────┐
+│  doc_intake_node │  Load claim context from claim store.
+│                  │  Validate document_refs is non-empty.
+│                  │  Write claim_context, doc_refs to state.
+└────────┬─────────┘
+         │
+         ├──────────────────────────────┬──────────────────────────────┐
+         ▼                              ▼                              ▼
+┌──────────────────┐     ┌──────────────────────────┐    ┌────────────────────────┐
+│ photo_auth_node  │     │ estimate_check_node       │    │ narrative_check_node   │
+│                  │     │                           │    │                        │
+│ EXIF metadata +  │     │ Repair estimate vs        │    │ Rule-based:            │
+│ perceptual hash. │     │ regional historical       │    │ loss_type ↔ damage     │
+│ Flag forged or   │     │ actuals for vehicle       │    │ description            │
+│ reused images.   │     │ make/model/year.          │    │ consistency.           │
+│ Writes           │     │ Writes                    │    │ Writes                 │
+│ photo_auth_      │     │ estimate_check_result.    │    │ narrative_check_result.│
+│ result.          │     │                           │    │                        │
+└────────┬─────────┘     └──────────────┬────────────┘    └──────────────┬─────────┘
+         └────────────────────────────────┴──────────────────────────────┘
+                                          │
+                                          ▼
+                              ┌───────────────────────┐
+                              │  doc_decision_node    │
+                              │                       │
+                              │  Aggregate all three  │
+                              │  check results.       │
+                              │  PASS: all clear.     │
+                              │  FLAG: ≥1 failed.     │
+                              │  Writes doc_verdict,  │
+                              │  doc_evidence_summary.│
+                              └──────────┬────────────┘
+                                         │
+                              PASS ───────┴────── FLAG
+                               │                    │
+                               ▼                    ▼
+                   ┌──────────────────┐  ┌────────────────────────┐
+                   │  doc_audit_node  │  │  flag_escalation_node  │
+                   │  Write PASS to   │  │                        │
+                   │  claim store.    │  │  Active SIU case:      │
+                   └──────────────────┘  │  append FLAG to        │
+                                         │  InvestigatorCopilot   │
+                                         │  evidence_checklist.   │
+                                         │                        │
+                                         │  STP claim (no active  │
+                                         │  case): create manual  │
+                                         │  review task.          │
+                                         │  Writes flag_action.   │
+                                         └──────────┬─────────────┘
+                                                    │
+                                                    ▼
+                                         ┌──────────────────┐
+                                         │  doc_audit_node  │
+                                         │  Write FLAG +    │
+                                         │  evidence to     │
+                                         │  claim store.    │
+                                         └──────────────────┘
+```
+
+**Design decisions:**
+- No dedicated HITL interrupt. FLAG results are routed to the InvestigatorCopilot's existing evidence checklist via `flag_escalation_node`, avoiding a second review queue for investigators.
+- `photo_auth_node`, `estimate_check_node`, and `narrative_check_node` run in parallel fan-out — no data dependency between them. `doc_decision_node` is the fan-in point.
+- `thread_id = doc_verify_{claim_id}` prevents checkpoint key collision with the FNOL graph's `thread_id = claim_id`.
+
+---
+
+### 2d. Subrogation Graph
+
+**Lifecycle:** Post-settlement. Triggered when a claim status transitions to `SETTLED`. This is a distinct event source — claims settle days to weeks after the initial FNOL submission, so this graph cannot be a node in the FNOL async path.
+**Thread ID:** `subrogation_{claim_id}` — isolated from both the FNOL and DocumentVerification checkpoints.
+**HITL:** Applies only when `recovery_amount > SUBROGATION_HIGH_VALUE_THRESHOLD` (config). Requires senior claims handler approval before a recovery demand is issued.
+
+```
+Claim SETTLED Event
+(claim_id + settlement_amount — emitted on claim status → SETTLED)
+      │
+      ▼
+┌─────────────────────┐
+│ subrogation_intake  │  Load settled claim from claim store.
+│ _node               │  Validate settlement_amount > 0.
+│                     │  Load police_report_ref, telematics_crash_ref.
+│                     │  Write claim_context, settlement_amount to state.
+└──────────┬──────────┘
+           │
+           ├──────────────────────────────────────────────┐
+           ▼                                              ▼
+┌──────────────────────┐                   ┌─────────────────────────────┐
+│ liability_scoring    │                   │ evidence_assembly_node       │
+│ _node                │                   │                             │
+│ Police report +      │                   │ Collect: police report,     │
+│ telematics_crash_    │                   │ photos, witness statements. │
+│ match. Computes      │                   │ Score evidence completeness.│
+│ at_fault_pct,        │                   │ Writes evidence_refs,       │
+│ confidence.          │                   │ evidence_score to state.   │
+│ Writes               │                   └─────────────────┬───────────┘
+│ liability_assessment.│                                     │
+└──────────┬───────────┘                                     │
+           └────────────────────────┬────────────────────────┘
+                                    ▼
+                     ┌──────────────────────────────────┐
+                     │  recovery_estimation_node         │
+                     │                                  │
+                     │  recovery = settlement_amount     │
+                     │    × at_fault_pct × confidence.  │
+                     │  viable = recovery >              │
+                     │    SUBROGATION_MIN_RECOVERY.      │
+                     │  Writes recovery_opportunity.     │
+                     └──────────────┬───────────────────┘
+                                    │
+                         viable ────┴──── not viable
+                           │                   │
+                           ▼                   ▼
+              ┌─────────────────────┐  ┌──────────────────────┐
+              │ recovery_routing    │  │ subrogation_close    │
+              │ _node               │  │ _node                │
+              │                     │  │                      │
+              │ recovery >          │  │ Write not-viable     │
+              │ HIGH_VALUE_         │  │ result to claim      │
+              │ THRESHOLD?          │  │ store. Audit log.    │
+              └──────────┬──────────┘  └──────────────────────┘
+                         │
+             YES ─────────┴──── NO
+              │                   │
+              ▼                   ▼
+[HITL INTERRUPT]       ┌────────────────────────┐
+(suspend graph)        │ subrogation_referral   │
+              │        │ _node                  │
+              ▼        │ Queue recovery demand  │
+┌──────────────────┐   │ to recovery team.      │
+│ senior_handler   │   │ Write referral_id.     │
+│ _review_node     │   └────────────────────────┘
+│                  │
+│ Present:         │
+│ liability,       │
+│ recovery_amount, │
+│ evidence_score.  │
+│ Awaits:          │
+│ APPROVE / DECLINE│
+└────────┬─────────┘
+         │
+  APPROVE┴── DECLINE
+     │              │
+     ▼              ▼
+┌──────────────┐  ┌──────────────────────┐
+│ subrogation  │  │ subrogation_close    │
+│ _referral    │  │ _node                │
+│ _node        │  └──────────────────────┘
+└──────────────┘
+```
+
+**Design decisions:**
+- Separate compilation from the FNOL graph is required — the settlement trigger fires on a different event (claim status change) and potentially weeks after the original FNOL submission. Cannot be a late async node in the FNOL graph.
+- `liability_scoring_node` and `evidence_assembly_node` run in parallel fan-out — evidence completeness scoring is independent of the liability calculation.
+- HITL scoped to high-value recovery only. Low-value demands (≤ `SUBROGATION_HIGH_VALUE_THRESHOLD`) proceed automatically to avoid manual overhead that would exceed recovery value.
+- `settlement_amount` is a required input from the SETTLED event payload. The Subrogation graph does not infer or read settlement amount from the FNOL graph checkpoint.
+- `SUBROGATION_MIN_RECOVERY` and `SUBROGATION_HIGH_VALUE_THRESHOLD` are both config values — not hardcoded in the graph.
 
 ---
 
@@ -379,6 +551,69 @@ class QuoteState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 ```
 
+### DocVerification State
+
+```python
+class DocVerificationState(TypedDict):
+    # Identity
+    claim_id: str
+    policy_id: str
+
+    # Input
+    doc_refs: list[str]                       # URIs to submitted documents
+    claim_context: dict[str, Any]             # loss_type, incident_description snapshot
+
+    # Sub-check results (written by parallel fan-out nodes)
+    photo_auth_result: dict[str, Any] | None
+    estimate_check_result: dict[str, Any] | None
+    narrative_check_result: dict[str, Any] | None
+
+    # Decision
+    doc_verdict: str | None                   # PASS / FLAG
+    doc_evidence_summary: list[str]
+
+    # Escalation
+    flag_action: str | None                   # APPENDED_TO_CASE / REVIEW_TASK_CREATED
+
+    # Audit
+    node_path: list[str]
+    messages: Annotated[list[BaseMessage], add_messages]
+```
+
+### Subrogation State
+
+```python
+class SubrogationState(TypedDict):
+    # Identity
+    claim_id: str
+    policy_id: str
+
+    # Input (from SETTLED event — both required at graph entry)
+    settlement_amount: float
+    claim_context: dict[str, Any]
+
+    # Evidence (loaded by intake and assembly nodes)
+    police_report_ref: str | None
+    telematics_crash_ref: str | None
+    evidence_refs: list[str]
+    evidence_score: float | None              # completeness score [0.0–1.0]
+
+    # Scoring
+    liability_assessment: dict[str, Any] | None   # at_fault_pct, confidence, evidence list
+    recovery_opportunity: dict[str, Any] | None   # recovery_amount, viable
+
+    # HITL (high-value recovery only)
+    senior_handler_decision: str | None           # APPROVE / DECLINE
+    senior_handler_notes: str | None
+
+    # Output
+    referral_id: str | None
+
+    # Audit
+    node_path: list[str]
+    messages: Annotated[list[BaseMessage], add_messages]
+```
+
 **Design rules:**
 - All state fields are plain Python types or Pydantic models — no LangGraph internals leak into state definitions.
 - `messages` is the only field that uses a LangGraph reducer (`add_messages`). All other fields are last-write-wins.
@@ -391,8 +626,11 @@ class QuoteState(TypedDict):
 
 LangGraph suspends graph execution at a designated node boundary. State is
 persisted to the checkpoint store. Execution resumes when the human submits a
-decision — which may be hours or days later. The same pattern applies to both
-the FNOL investigator review and the underwriting underwriter review.
+decision — which may be hours or days later. The same pattern applies to all
+four HITL interrupt points: FNOL investigator review, underwriting underwriter
+review, and subrogation senior handler review (high-value recovery only).
+DocumentVerification has no dedicated HITL — FLAG results are delegated to the
+InvestigatorCopilot workflow via `flag_escalation_node`.
 
 ### FNOL — Investigator Copilot
 
@@ -464,12 +702,48 @@ result = app.invoke(None, config={"configurable": {"thread_id": quote_id}})
 If `underwriter_decision == "DECLINE"`, `quote_gen_node` is skipped and the
 graph routes to a rejection notice node (not shown — same pattern as audit_node).
 
+### Subrogation — Senior Handler Review (high-value recovery only)
+
+```python
+graph = StateGraph(SubrogationState)
+
+# Suspend BEFORE senior_handler_review_node executes.
+# Only reached when recovery_amount > SUBROGATION_HIGH_VALUE_THRESHOLD (config).
+
+app = graph.compile(
+    checkpointer=checkpointer,
+    interrupt_before=["senior_handler_review_node"],
+)
+```
+
+**Resume flow:**
+
+```python
+# 1. Senior handler submits decision via API
+handler_decision = {
+    "senior_handler_decision": "APPROVE",
+    "senior_handler_notes": "Police report confirms clear third-party liability"
+}
+
+# 2. Update state with decision
+app.update_state(
+    config={"configurable": {"thread_id": f"subrogation_{claim_id}"}},
+    values=handler_decision,
+)
+
+# 3. Resume — proceeds to subrogation_referral_node on APPROVE
+result = app.invoke(None, config={"configurable": {"thread_id": f"subrogation_{claim_id}"}})
+```
+
+If `senior_handler_decision == "DECLINE"`, the graph routes to `subrogation_close_node`.
+
 **Shared HITL rules:**
 - The graph does not poll. It suspends and waits for an external `update_state` + `invoke(None)` call.
-- The decision field (`investigator_decision` / `underwriter_decision`) is `None` at interrupt time. The review node checks for `None` and blocks if not yet populated.
+- The decision field (`investigator_decision` / `underwriter_decision` / `senior_handler_decision`) is `None` at interrupt time. The review node checks for `None` and blocks if not yet populated.
 - FNOL: STP claims (`score < 0.25`) never hit the interrupt — they route directly to `audit_node`.
 - UW: LOW and MEDIUM risk tiers never hit the interrupt — they route directly to `quote_gen_node`.
-- Override rate is tracked as a model health signal for both graphs.
+- Subrogation: Only claims where `recovery_amount > SUBROGATION_HIGH_VALUE_THRESHOLD` hit the interrupt — all others route directly to `subrogation_referral_node`.
+- Override rate is tracked as a model health signal for all three graphs.
 
 ---
 
@@ -499,9 +773,16 @@ payloads, and require durability guarantees Redis RDB/AOF alone does not
 provide in all configurations. Postgres is the safer default for checkpoint
 durability.
 
-**Checkpoint key:** `thread_id = claim_id`. Every graph run for the same claim
-resumes from the last committed checkpoint — including async path re-scores
-and investigator-resumed HITL flows.
+**Checkpoint keys by graph:**
+
+| Graph | `thread_id` | Rationale |
+|---|---|---|
+| FNOL sync + async | `claim_id` | Single thread for both compilations — async path resumes from sync checkpoint |
+| DocumentVerification | `doc_verify_{claim_id}` | Avoids key collision with FNOL checkpoint |
+| Subrogation | `subrogation_{claim_id}` | Different lifecycle (post-settlement); distinct namespace |
+| Underwriting | `quote_id` | Separate claim lifecycle; never shares thread with FNOL |
+
+All four graphs use the same checkpoint store (PostgreSQL). Thread ID prefix convention makes claim history queryable across graphs for audit purposes.
 
 ---
 
@@ -535,12 +816,40 @@ and investigator-resumed HITL flows.
 | `quote_gen_node` | Sync | 2–8s | Yes — LLM call |
 | `issuance_node` (incl. payment call) | Sync | <500ms | Yes — payment + write |
 
+**DocumentVerification graph:**
+
+| Graph Section | Path | Latency | Blocks Customer? |
+|---|---|---|---|
+| `doc_intake_node` | Async | <10ms | No — post-audit |
+| `photo_auth_node` + `estimate_check_node` + `narrative_check_node` (parallel) | Async | 1–10s | No |
+| `doc_decision_node` | Async | <5ms | No |
+| `flag_escalation_node` | Async | <50ms | No |
+| `doc_audit_node` | Async | <10ms | No |
+
+**Subrogation graph:**
+
+| Graph Section | Path | Latency | Blocks Customer? |
+|---|---|---|---|
+| `subrogation_intake_node` | Async | <10ms | No — post-settlement |
+| `liability_scoring_node` + `evidence_assembly_node` (parallel) | Async | 500ms–5s | No |
+| `recovery_estimation_node` | Async | <5ms | No |
+| `recovery_routing_node` | Async | <5ms | No |
+| `senior_handler_review_node` | HITL | Hours–days | No (high-value only) |
+| `subrogation_referral_node` | Async | <50ms | No |
+| `subrogation_close_node` | Async | <10ms | No |
+
 **Implementation pattern:**
 The sync and async paths are separate graph compilations — not parallel branches
 in one graph. The sync graph completes and returns within the FNOL HTTP request
 lifecycle. The async graph is triggered as a background job (SQS / Azure Service
 Bus / OCP Job) using the same `claim_id` as `thread_id`, resuming from the
 checkpoint written by the sync graph.
+
+DocumentVerification and Subrogation graphs are each separate compilations with
+their own thread ID prefix. DocumentVerification is triggered alongside the FNOL
+async path at `audit_node` completion. Subrogation is triggered independently by
+the claim SETTLED status event — a different event source with a different
+operational timeline.
 
 ---
 
