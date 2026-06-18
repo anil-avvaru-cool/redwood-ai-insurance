@@ -14,8 +14,8 @@
 ## Table of Contents
 1. [Layer Separation](#1-layer-separation)
 2. [FNOL Multi-Agent System](#2-fnol-multi-agent-system)
-   - [2c. DocumentVerification Graph](#2c-documentverification-graph)
-   - [2d. Subrogation Graph](#2d-subrogation-graph)
+   - [2c. DocumentVerification Agent](#2c-documentverification-agent)
+   - [2d. Subrogation Agent](#2d-subrogation-agent)
 3. [Underwriting Quote Agent](#3-underwriting-quote-agent)
 4. [State Schema Design](#4-state-schema-design)
 5. [HITL Interrupt Pattern](#5-hitl-interrupt-pattern)
@@ -24,15 +24,21 @@
 8. [LangChain Integration Points](#8-langchain-integration-points)
 9. [What NOT to Use from LangChain](#9-what-not-to-use-from-langchain)
 10. [Deployment Mapping](#10-deployment-mapping)
+11. [MCP Tool Layer](#11-mcp-tool-layer)
+12. [Agent-to-Agent Integration Patterns](#12-agent-to-agent-integration-patterns)
 
 ---
 
 ## 1. Layer Separation
 
-Three distinct layers with hard module boundaries. No layer imports from a lower layer.
+Four distinct layers with hard module boundaries. No layer imports from a lower layer.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
+│  AGENT INTEGRATION LAYER                                        │
+│  Event-bus triggers · RemoteGraph invocation                    │
+│  MCP client calls · cross-agent state via claim store           │
+├─────────────────────────────────────────────────────────────────┤
 │  ORCHESTRATION LAYER — LangGraph                                │
 │  StateGraph topology · node routing · HITL interrupts           │
 │  checkpointing · conditional edges · graph compilation          │
@@ -52,6 +58,10 @@ Three distinct layers with hard module boundaries. No layer imports from a lower
 **Module boundary rule:** `features/`, `models/`, `graph/`, `entities/` have no
 LangChain imports. Enforced by import linting in CI. LangChain lives only in
 `agents/nodes/` and `agents/chains/`.
+
+**MCP tool calls** are made from graph nodes via a thin async MCP client. MCP client
+code lives in `agents/nodes/` — same boundary as LangChain. Business logic and ML
+scoring layers have no MCP dependency.
 
 ---
 
@@ -132,6 +142,7 @@ FNOL Submission
                │
                ▼
      [ASYNC PATH — post-submission, non-blocking]
+     [EVENT emitted → DocumentVerificationAgent triggered (Pattern A)]
                │
        ┌───────┴────────────────────────────────────────┐
        ▼               ▼               ▼                ▼
@@ -179,11 +190,23 @@ They are calibrated to minimize expected dollar loss, not maximize accuracy.
 
 ---
 
-### 2c. DocumentVerification Graph
+### 2c. DocumentVerification Agent
 
-**Lifecycle:** Async. Triggered at `audit_node` completion — same trigger point as the existing async FNOL path. Runs as a separate async job (SQS / Azure Service Bus / OCP Job).
-**Thread ID:** `doc_verify_{claim_id}` — isolated from the FNOL graph's `claim_id` checkpoint to prevent key collision.
-**State source:** Reads claim context from the claim store directly, not from the FNOL LangGraph checkpoint. Keeps this graph decoupled from FNOL graph internals.
+**Deployment:** Independent LangGraph server (`doc-verification-agent`). Not a subgraph
+inside the FNOL service — a separately deployed FastAPI + LangGraph instance.
+
+**Lifecycle:** Async. Triggered at `audit_node` completion via event-bus (SQS / Azure
+Service Bus / OCP Job). See [DEC-017](./DECISION_LOG.md#dec-017----event-bus-trigger-vs-remotegraph-invocation-decision-boundary) for the trigger pattern decision.
+
+**Thread ID:** `doc_verify_{claim_id}` — isolated from the FNOL graph's `claim_id`
+checkpoint to prevent key collision.
+
+**State source:** Reads claim context from the claim store directly, not from the FNOL
+LangGraph checkpoint. Keeps this agent decoupled from FNOL graph internals.
+
+**MCP tools used:** `exif_analyzer`, `perceptual_hash_checker` (via `doc-verification-mcp-server`);
+`repair_estimate_validator`, `narrative_consistency_checker` (via `doc-verification-mcp-server`).
+See [MCP_Tool_Contracts.md](./MCP_Tool_Contracts.md) for full schemas.
 
 ```
 Document Submission Event
@@ -201,12 +224,17 @@ Document Submission Event
 ┌──────────────────┐     ┌──────────────────────────┐    ┌────────────────────────┐
 │ photo_auth_node  │     │ estimate_check_node       │    │ narrative_check_node   │
 │                  │     │                           │    │                        │
-│ EXIF metadata +  │     │ Repair estimate vs        │    │ Rule-based:            │
-│ perceptual hash. │     │ regional historical       │    │ loss_type ↔ damage     │
-│ Flag forged or   │     │ actuals for vehicle       │    │ description            │
-│ reused images.   │     │ make/model/year.          │    │ consistency.           │
-│ Writes           │     │ Writes                    │    │ Writes                 │
-│ photo_auth_      │     │ estimate_check_result.    │    │ narrative_check_result.│
+│ MCP tools:       │     │ MCP tool:                 │    │ MCP tool:              │
+│ exif_analyzer    │     │ repair_estimate_validator │    │ narrative_consistency  │
+│ perceptual_hash  │     │                           │    │ _checker               │
+│ _checker         │     │ Repair estimate vs        │    │                        │
+│                  │     │ regional historical       │    │ Rule-based:            │
+│ EXIF metadata +  │     │ actuals for vehicle       │    │ loss_type ↔ damage     │
+│ perceptual hash. │     │ make/model/year.          │    │ description            │
+│ Flag forged or   │     │ Writes                    │    │ consistency.           │
+│ reused images.   │     │ estimate_check_result.    │    │ Writes                 │
+│ Writes           │     │                           │    │ narrative_check_result.│
+│ photo_auth_      │     │                           │    │                        │
 │ result.          │     │                           │    │                        │
 └────────┬─────────┘     └──────────────┬────────────┘    └──────────────┬─────────┘
          └────────────────────────────────┴──────────────────────────────┘
@@ -217,6 +245,10 @@ Document Submission Event
                               │                       │
                               │  Aggregate all three  │
                               │  check results.       │
+                              │  SERVICE_UNAVAILABLE  │
+                              │  tool errors →        │
+                              │  INCONCLUSIVE (not    │
+                              │  PASS or FLAG).       │
                               │  PASS: all clear.     │
                               │  FLAG: ≥1 failed.     │
                               │  Writes doc_verdict,  │
@@ -250,17 +282,37 @@ Document Submission Event
 ```
 
 **Design decisions:**
-- No dedicated HITL interrupt. FLAG results are routed to the InvestigatorCopilot's existing evidence checklist via `flag_escalation_node`, avoiding a second review queue for investigators.
-- `photo_auth_node`, `estimate_check_node`, and `narrative_check_node` run in parallel fan-out — no data dependency between them. `doc_decision_node` is the fan-in point.
-- `thread_id = doc_verify_{claim_id}` prevents checkpoint key collision with the FNOL graph's `thread_id = claim_id`.
+- No dedicated HITL interrupt. FLAG results are routed to the InvestigatorCopilot's
+  existing evidence checklist via `flag_escalation_node`, avoiding a second review
+  queue for investigators.
+- `photo_auth_node`, `estimate_check_node`, and `narrative_check_node` run in parallel
+  fan-out — no data dependency between them. `doc_decision_node` is the fan-in point.
+- `thread_id = doc_verify_{claim_id}` prevents checkpoint key collision with the FNOL
+  graph's `thread_id = claim_id`.
+- MCP tool `SERVICE_UNAVAILABLE` errors produce `INCONCLUSIVE` verdict in
+  `doc_decision_node` — not a false FLAG. Audit node records the partial result.
 
 ---
 
-### 2d. Subrogation Graph
+### 2d. Subrogation Agent
 
-**Lifecycle:** Post-settlement. Triggered when a claim status transitions to `SETTLED`. This is a distinct event source — claims settle days to weeks after the initial FNOL submission, so this graph cannot be a node in the FNOL async path.
-**Thread ID:** `subrogation_{claim_id}` — isolated from both the FNOL and DocumentVerification checkpoints.
-**HITL:** Applies only when `recovery_amount > SUBROGATION_HIGH_VALUE_THRESHOLD` (config). Requires senior claims handler approval before a recovery demand is issued.
+**Deployment:** Independent LangGraph server (`subrogation-agent`). Separately deployed
+FastAPI + LangGraph instance.
+
+**Lifecycle:** Post-settlement. Triggered when a claim status transitions to `SETTLED`
+via event-bus (SQS / Azure Service Bus / OCP Job). This is a distinct event source —
+claims settle days to weeks after the initial FNOL submission, so this agent cannot be
+a node in the FNOL async path.
+
+**Thread ID:** `subrogation_{claim_id}` — isolated from both the FNOL and
+DocumentVerification checkpoints.
+
+**HITL:** Applies only when `recovery_amount > SUBROGATION_HIGH_VALUE_THRESHOLD` (config).
+Requires senior claims handler approval before a recovery demand is issued.
+
+**MCP tools used:** `police_report_api`, `telematics_crash_query`, `evidence_collector`
+(via `claims-data-mcp-server`); `recovery_demand_queue` (via `subrogation-mcp-server`).
+See [MCP_Tool_Contracts.md](./MCP_Tool_Contracts.md) for full schemas.
 
 ```
 Claim SETTLED Event
@@ -279,12 +331,17 @@ Claim SETTLED Event
 ┌──────────────────────┐                   ┌─────────────────────────────┐
 │ liability_scoring    │                   │ evidence_assembly_node       │
 │ _node                │                   │                             │
-│ Police report +      │                   │ Collect: police report,     │
-│ telematics_crash_    │                   │ photos, witness statements. │
-│ match. Computes      │                   │ Score evidence completeness.│
-│ at_fault_pct,        │                   │ Writes evidence_refs,       │
-│ confidence.          │                   │ evidence_score to state.   │
-│ Writes               │                   └─────────────────┬───────────┘
+│ MCP tools:           │                   │ MCP tool:                   │
+│ police_report_api    │                   │ evidence_collector          │
+│ telematics_crash_    │                   │                             │
+│ query                │                   │ Collect: police report,     │
+│                      │                   │ photos, witness statements. │
+│ Police report +      │                   │ Score evidence completeness.│
+│ telematics_crash_    │                   │ Writes evidence_refs,       │
+│ match. Computes      │                   │ evidence_score to state.    │
+│ at_fault_pct,        │                   └─────────────────┬───────────┘
+│ confidence.          │                                     │
+│ Writes               │                                     │
 │ liability_assessment.│                                     │
 └──────────┬───────────┘                                     │
            └────────────────────────┬────────────────────────┘
@@ -317,13 +374,13 @@ Claim SETTLED Event
 [HITL INTERRUPT]       ┌────────────────────────┐
 (suspend graph)        │ subrogation_referral   │
               │        │ _node                  │
-              ▼        │ Queue recovery demand  │
-┌──────────────────┐   │ to recovery team.      │
-│ senior_handler   │   │ Write referral_id.     │
-│ _review_node     │   └────────────────────────┘
-│                  │
-│ Present:         │
-│ liability,       │
+              ▼        │ MCP tool:              │
+┌──────────────────┐   │ recovery_demand_queue  │
+│ senior_handler   │   │                        │
+│ _review_node     │   │ Queue recovery demand  │
+│                  │   │ to recovery team.      │
+│ Present:         │   │ Write referral_id.     │
+│ liability,       │   └────────────────────────┘
 │ recovery_amount, │
 │ evidence_score.  │
 │ Awaits:          │
@@ -341,11 +398,17 @@ Claim SETTLED Event
 ```
 
 **Design decisions:**
-- Separate compilation from the FNOL graph is required — the settlement trigger fires on a different event (claim status change) and potentially weeks after the original FNOL submission. Cannot be a late async node in the FNOL graph.
-- `liability_scoring_node` and `evidence_assembly_node` run in parallel fan-out — evidence completeness scoring is independent of the liability calculation.
-- HITL scoped to high-value recovery only. Low-value demands (≤ `SUBROGATION_HIGH_VALUE_THRESHOLD`) proceed automatically to avoid manual overhead that would exceed recovery value.
-- `settlement_amount` is a required input from the SETTLED event payload. The Subrogation graph does not infer or read settlement amount from the FNOL graph checkpoint.
-- `SUBROGATION_MIN_RECOVERY` and `SUBROGATION_HIGH_VALUE_THRESHOLD` are both config values — not hardcoded in the graph.
+- Separate compilation from the FNOL graph is required — the settlement trigger fires
+  on a different event (claim status change) and potentially weeks after the original
+  FNOL submission. Cannot be a late async node in the FNOL graph.
+- `liability_scoring_node` and `evidence_assembly_node` run in parallel fan-out —
+  evidence completeness scoring is independent of the liability calculation.
+- HITL scoped to high-value recovery only. Low-value demands (≤ `SUBROGATION_HIGH_VALUE_THRESHOLD`)
+  proceed automatically to avoid manual overhead that would exceed recovery value.
+- `settlement_amount` is a required input from the SETTLED event payload. The Subrogation
+  agent does not infer or read settlement amount from the FNOL graph checkpoint.
+- `SUBROGATION_MIN_RECOVERY` and `SUBROGATION_HIGH_VALUE_THRESHOLD` are both config
+  values — not hardcoded in the graph.
 
 ---
 
@@ -569,7 +632,7 @@ class DocVerificationState(TypedDict):
     narrative_check_result: dict[str, Any] | None
 
     # Decision
-    doc_verdict: str | None                   # PASS / FLAG
+    doc_verdict: str | None                   # PASS / FLAG / INCONCLUSIVE
     doc_evidence_summary: list[str]
 
     # Escalation
@@ -619,6 +682,7 @@ class SubrogationState(TypedDict):
 - `messages` is the only field that uses a LangGraph reducer (`add_messages`). All other fields are last-write-wins.
 - `audit_trail` and `node_path` are append-only by convention. Use a custom reducer if parallel branches write simultaneously.
 - State is serialized to JSON for checkpointing — no non-serializable objects in state.
+- `doc_verdict` now has three values: `PASS`, `FLAG`, `INCONCLUSIVE` (MCP tool unavailable).
 
 ---
 
@@ -627,7 +691,7 @@ class SubrogationState(TypedDict):
 LangGraph suspends graph execution at a designated node boundary. State is
 persisted to the checkpoint store. Execution resumes when the human submits a
 decision — which may be hours or days later. The same pattern applies to all
-four HITL interrupt points: FNOL investigator review, underwriting underwriter
+three HITL interrupt points: FNOL investigator review, underwriting underwriter
 review, and subrogation senior handler review (high-value recovery only).
 DocumentVerification has no dedicated HITL — FLAG results are delegated to the
 InvestigatorCopilot workflow via `flag_escalation_node`.
@@ -764,7 +828,7 @@ Next node starts
 | Local / dev | `SqliteSaver` | Zero infrastructure. File-backed. |
 | Production (AWS) | `PostgresSaver` (RDS) or custom Redis | Durable, query-able by `claim_id` |
 | Production (Azure) | `PostgresSaver` (Azure Database for PostgreSQL) | Same API |
-| Production (OpenShift) | `PostgresSaver` (CrunhyData PGO) | Operator-managed Postgres |
+| Production (OpenShift) | `PostgresSaver` (CrunchyData PGO) | Operator-managed Postgres |
 
 **Why not Redis as primary checkpoint store:**
 Redis is used for online feature serving at sub-10ms latency. Claim state
@@ -816,26 +880,26 @@ All four graphs use the same checkpoint store (PostgreSQL). Thread ID prefix con
 | `quote_gen_node` | Sync | 2–8s | Yes — LLM call |
 | `issuance_node` (incl. payment call) | Sync | <500ms | Yes — payment + write |
 
-**DocumentVerification graph:**
+**DocumentVerification agent:**
 
 | Graph Section | Path | Latency | Blocks Customer? |
 |---|---|---|---|
 | `doc_intake_node` | Async | <10ms | No — post-audit |
-| `photo_auth_node` + `estimate_check_node` + `narrative_check_node` (parallel) | Async | 1–10s | No |
+| `photo_auth_node` + `estimate_check_node` + `narrative_check_node` (parallel, MCP calls) | Async | 1–10s | No |
 | `doc_decision_node` | Async | <5ms | No |
 | `flag_escalation_node` | Async | <50ms | No |
 | `doc_audit_node` | Async | <10ms | No |
 
-**Subrogation graph:**
+**Subrogation agent:**
 
 | Graph Section | Path | Latency | Blocks Customer? |
 |---|---|---|---|
 | `subrogation_intake_node` | Async | <10ms | No — post-settlement |
-| `liability_scoring_node` + `evidence_assembly_node` (parallel) | Async | 500ms–5s | No |
+| `liability_scoring_node` + `evidence_assembly_node` (parallel, MCP calls) | Async | 500ms–5s | No |
 | `recovery_estimation_node` | Async | <5ms | No |
 | `recovery_routing_node` | Async | <5ms | No |
 | `senior_handler_review_node` | HITL | Hours–days | No (high-value only) |
-| `subrogation_referral_node` | Async | <50ms | No |
+| `subrogation_referral_node` (MCP call) | Async | <50ms | No |
 | `subrogation_close_node` | Async | <10ms | No |
 
 **Implementation pattern:**
@@ -845,8 +909,8 @@ lifecycle. The async graph is triggered as a background job (SQS / Azure Service
 Bus / OCP Job) using the same `claim_id` as `thread_id`, resuming from the
 checkpoint written by the sync graph.
 
-DocumentVerification and Subrogation graphs are each separate compilations with
-their own thread ID prefix. DocumentVerification is triggered alongside the FNOL
+DocumentVerification and Subrogation agents are each separate service deployments
+with their own thread ID prefix. DocumentVerification is triggered alongside the FNOL
 async path at `audit_node` completion. Subrogation is triggered independently by
 the claim SETTLED status event — a different event source with a different
 operational timeline.
@@ -916,9 +980,12 @@ mutable shared state outside the graph — it breaks checkpointing.
 
 | Component | AWS | Azure | OpenShift |
 |---|---|---|---|
-| FNOL agent graph | EKS pod (LangGraph) | AKS pod (LangGraph) | OCP Deployment (LangGraph) |
-| Quote agent graph | EKS pod (LangGraph) | AKS pod (LangGraph) | OCP Deployment (LangGraph) |
-| Checkpoint store | RDS PostgreSQL | Azure Database for PostgreSQL | CrunchyData PGO |
+| FNOL agent (`fnol-claims-agent`) | EKS pod (LangGraph server) | AKS pod (LangGraph server) | OCP Deployment (LangGraph server) |
+| Quote agent (`underwriting-quote-agent`) | EKS pod (LangGraph server) | AKS pod (LangGraph server) | OCP Deployment (LangGraph server) |
+| DocVerification agent (`doc-verification-agent`) | EKS pod (LangGraph server) | AKS pod (LangGraph server) | OCP Deployment (LangGraph server) |
+| Subrogation agent (`subrogation-agent`) | EKS pod (LangGraph server) | AKS pod (LangGraph server) | OCP Deployment (LangGraph server) |
+| MCP servers (`doc-verification-mcp-server`, `claims-data-mcp-server`, `subrogation-mcp-server`) | EKS pods | AKS pods | OCP Deployments |
+| Checkpoint store (all agents) | RDS PostgreSQL | Azure Database for PostgreSQL | CrunchyData PGO |
 | Async job trigger | SQS + Lambda | Azure Service Bus + Function | OCP Job / Tekton |
 | LLM backend | Bedrock | Azure OpenAI | vLLM on GPU nodepool |
 | Feature store (sync) | ElastiCache Redis | Azure Cache for Redis | Redis Operator |
@@ -928,6 +995,108 @@ LangGraph itself has no cloud dependency — the same `StateGraph` code runs
 on all three substrates. Only the checkpointer backend and LLM factory
 function are substrate-specific. See DEC-014.
 
+See [DEPLOYMENT_TOPOLOGIES.md](./DEPLOYMENT_TOPOLOGIES.md) for full service inventory,
+scaling configuration, health check patterns, and the per-substrate RemoteGraph URL map.
+
 ---
 
-*Architecture version: 2026-Q2 | Applies to: `fnol-claims-multi-agent-system/`, `intelligent-underwriting-platform/`*
+## 11. MCP Tool Layer
+
+Graph nodes in `DocumentVerificationAgent` and `SubrogationAgent` call external
+systems through MCP tools rather than direct Python function calls. This keeps node
+logic as pure orchestration.
+
+**Three MCP servers, grouped by data access domain:**
+
+| MCP Server | Tools | Used By |
+|---|---|---|
+| `doc-verification-mcp-server` | `exif_analyzer`, `perceptual_hash_checker`, `repair_estimate_validator`, `narrative_consistency_checker` | `DocumentVerificationAgent` |
+| `claims-data-mcp-server` | `police_report_api`, `telematics_crash_query`, `evidence_collector` | `SubrogationAgent`; shared candidates for `FNOLAgent` |
+| `subrogation-mcp-server` | `recovery_demand_queue` | `SubrogationAgent` |
+
+**FNOL sync path does not use MCP.** Nodes on the `intake_node` → `decision_routing_node`
+path call Python functions directly — adding a network hop to an already
+sub-65ms budget is not acceptable.
+
+**Tool error handling in nodes:** `ToolDependencyError` (upstream unavailable) is caught
+at the node boundary and written to state as a `SERVICE_UNAVAILABLE` flag — the exception
+never propagates to the LangGraph runtime. `doc_decision_node` treats a `SERVICE_UNAVAILABLE`
+result as `INCONCLUSIVE`, not `FLAG`.
+
+See [MCP_Tool_Contracts.md](./MCP_Tool_Contracts.md) for full input/output schemas,
+flag definitions, versioning policy, and error contracts for all eight tools.
+
+---
+
+## 12. Agent-to-Agent Integration Patterns
+
+Two distinct patterns govern how agents trigger or communicate with each other.
+The choice is determined by whether the caller requires a response.
+
+### Pattern A — Event-Bus Trigger (fire-and-forget)
+
+Used when the caller does not need a response and the triggered agent operates
+on a different lifecycle event.
+
+```
+Caller graph completes a node
+        │
+        ▼
+Emit event (SQS message / Service Bus message / OCP Job)
+        │
+        ▼
+Target agent service consumes event and starts independently
+```
+
+**Current uses:**
+
+| Trigger Point | Event | Target Agent |
+|---|---|---|
+| `audit_node` completion | `doc_verify_requested` + `{claim_id, doc_refs}` | `DocumentVerificationAgent` |
+| Claim status → `SETTLED` | `claim_settled` + `{claim_id, settlement_amount}` | `SubrogationAgent` |
+
+### Pattern B — RemoteGraph Invocation (synchronous, response required)
+
+Used when the calling agent needs the result before it can proceed. Uses LangGraph's
+`RemoteGraph` — the target agent runs as a subgraph call, retaining its own checkpoint
+store and HITL support.
+
+```python
+from langgraph.pregel.remote import RemoteGraph
+
+doc_verify_agent = RemoteGraph(
+    "doc-verification-agent",
+    url=os.environ["DOC_VERIFY_AGENT_URL"],
+)
+
+result = await doc_verify_agent.ainvoke({
+    "claim_id": state["claim_id"],
+    "doc_refs": state["doc_refs"],
+    "claim_context": state["claim_context"],
+})
+```
+
+**Current candidates (not yet implemented):**
+
+| Calling Agent | Target Agent | Trigger Condition |
+|---|---|---|
+| `UnderwritingAgent / issuance_node` | `DocumentVerificationAgent` | If document verification is required to gate policy issuance |
+
+### Pattern Selection Rule
+
+| Condition | Pattern |
+|---|---|
+| Caller does not need result | A — Event-Bus |
+| Caller needs result before continuing | B — RemoteGraph |
+| Triggered by a lifecycle event on a different timeline (SETTLED, AUDIT_COMPLETE) | A — Event-Bus |
+| Triggered within the same request lifecycle | B — RemoteGraph |
+
+**Do not implement a custom A2A protocol.** LangGraph `RemoteGraph` is the standard
+inter-agent call mechanism. It preserves checkpoint isolation, HITL support, and
+substrate portability without additional infrastructure.
+
+See [DEC-017](./DECISION_LOG.md#dec-017----event-bus-trigger-vs-remotegraph-invocation-decision-boundary) for full rationale.
+
+---
+
+*Architecture version: 2026-Q2 | Applies to: `fnol-claims-multi-agent-system/`, `intelligent-underwriting-platform/`, `doc-verification-agent/`, `subrogation-agent/`*

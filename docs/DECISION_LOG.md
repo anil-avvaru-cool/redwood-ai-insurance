@@ -232,3 +232,105 @@ Each entry captures:
 **Trade-off accepted:** LangChain has a large dependency footprint and ships breaking changes between minor versions. Pin to a specific version in `pyproject.toml`. The ML scoring path (XGBoost, feature store, Neo4j graph queries) must never import LangChain — enforced by module boundary and import linting.
 
 **Applies to:** `fnol-claims-multi-agent-system/`, `intelligent-underwriting-platform/` (quote agent), `enterprise-rag-platform/`.
+
+---
+
+## DEC-016 — MCP Tool Layer for DocumentVerification and Subrogation Agents
+
+**Date:** 2026-Q2
+**Decision:** External API calls inside `DocumentVerificationAgent` and `SubrogationAgent`
+nodes are exposed as MCP (Model Context Protocol) server tools rather than direct Python
+function imports. Tools are grouped into three MCP servers by data access domain:
+`doc-verification-mcp-server`, `claims-data-mcp-server`, and `subrogation-mcp-server`.
+
+**Rationale:** Node logic should orchestrate, not execute external I/O directly. MCP tools
+provide independently versioned, testable I/O contracts at the boundary between graph nodes
+and external systems (telematics providers, police report APIs, image hash index, repair
+estimate DB). This enables:
+- Independent versioning and deployment of tools without redeploying the graph
+- Reuse of shared tools (`police_report_api`, `evidence_collector`) across agents without
+  duplicating code
+- Testability of each tool in isolation — tool tests do not require a running graph
+
+**Alternative considered:** Keep external calls as plain Python functions imported directly
+into node files. Rejected — creates tight coupling between node code and external API
+clients, makes cross-agent reuse require shared Python imports (module coupling), and
+prevents independent versioning.
+
+**Trade-off accepted:** Adds a network hop per tool call (MCP client → MCP server). Acceptable
+for DocumentVerification and Subrogation agents, which are entirely async paths with no
+customer-facing latency requirement. Not adopted for the FNOL sync path (`intake_node` →
+`decision_routing_node`) where sub-65ms latency is required — those nodes call Python
+functions directly.
+
+**Applies to:** `doc-verification-mcp-server/`, `claims-data-mcp-server/`,
+`subrogation-mcp-server/`, `MCP_Tool_Contracts.md`.
+
+---
+
+## DEC-017 — Event-Bus Trigger vs RemoteGraph Invocation Decision Boundary
+
+**Date:** 2026-Q2
+**Decision:** Two distinct integration patterns govern how agents trigger or call
+other agents. The choice is determined by whether the caller requires a response
+and whether the invocation is synchronous.
+
+**Pattern A — Event-Bus Trigger (fire-and-forget):**
+Used when the caller does not need a response and the triggered agent runs
+asynchronously on a different lifecycle event.
+
+```
+Trigger condition → Event (SQS / Azure Service Bus / OCP Job) → Agent starts independently
+```
+
+Current uses:
+- `audit_node` completion → triggers `DocumentVerificationAgent` via event
+- Claim status `SETTLED` → triggers `SubrogationAgent` via event
+
+**Pattern B — RemoteGraph Invocation (synchronous, response required):**
+Used when the caller needs the result before it can proceed. Uses LangGraph's
+`RemoteGraph` to call a separately deployed LangGraph server as a subgraph.
+
+```python
+from langgraph.pregel.remote import RemoteGraph
+
+doc_verify_agent = RemoteGraph(
+    "doc-verification-agent",
+    url=os.environ["DOC_VERIFY_AGENT_URL"],
+)
+
+result = await doc_verify_agent.ainvoke({
+    "claim_id": state["claim_id"],
+    "doc_refs": state["doc_refs"],
+})
+```
+
+Current candidates for Pattern B (not yet implemented):
+- `UnderwritingAgent / issuance_node` → `DocumentVerificationAgent` — if document
+  verification is required to gate policy issuance (future requirement).
+
+**Decision rule:**
+
+| Condition | Pattern |
+|---|---|
+| Caller does not need result | Event-Bus (Pattern A) |
+| Caller needs result synchronously | RemoteGraph (Pattern B) |
+| Triggered by a different lifecycle event (SETTLED, AUDIT_COMPLETE) | Event-Bus (Pattern A) |
+| Triggered within the same request lifecycle | RemoteGraph (Pattern B) |
+
+**Rationale:** Event-bus is the correct integration for post-audit and post-settlement
+triggers — the FNOL graph has already returned a response by the time these agents run.
+`RemoteGraph` is reserved for cases requiring a result before the calling graph can
+continue. Using `RemoteGraph` for fire-and-forget invocations adds unnecessary
+round-trip latency and creates a synchronous dependency on an async agent.
+
+**Alternative considered:** Always use `RemoteGraph` for all agent-to-agent calls.
+Rejected — creates synchronous coupling between FNOL and DocumentVerification,
+which would block the FNOL audit step on document analysis completion (seconds).
+
+**Alternative considered:** Implement a custom A2A (Agent-to-Agent) protocol. Rejected —
+LangGraph's `RemoteGraph` provides the same capability with no additional infrastructure
+and maintains full checkpoint and HITL support across the call boundary.
+
+**Applies to:** `fnol-claims-multi-agent-system/`, `doc-verification-mcp-server/`,
+`subrogation-mcp-server/`, `Multi_Agent_Architecture.md` (Section 11).

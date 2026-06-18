@@ -118,3 +118,117 @@ redwood-ai-insurance/helm/
 ```
 
 When a platform component changes, all three values files must be updated. The portability map above identifies which rows require substrate-specific changes versus which are substrate-agnostic.
+
+---
+
+## Independent Agent Service Topology
+
+`DocumentVerificationAgent` and `SubrogationAgent` are deployed as **separate LangGraph
+server instances** — not as modules inside the FNOL agent service. This section defines
+their service boundaries, scaling, and checkpoint isolation.
+
+### Service Inventory
+
+| Service Name | Triggered By | Trigger Pattern | HITL | Shares Checkpoint Store |
+|---|---|---|---|---|
+| `fnol-claims-agent` | FNOL HTTP submission | Sync request | Yes — investigator review | Yes (shared PostgreSQL, `thread_id=claim_id`) |
+| `doc-verification-agent` | `audit_node` completion event | Event-bus (Pattern A) | No | Yes (shared PostgreSQL, `thread_id=doc_verify_{claim_id}`) |
+| `subrogation-agent` | Claim `SETTLED` status event | Event-bus (Pattern A) | Yes — senior handler (high-value only) | Yes (shared PostgreSQL, `thread_id=subrogation_{claim_id}`) |
+| `underwriting-quote-agent` | Quote HTTP request | Sync request | Yes — underwriter review (HIGH tier) | Yes (shared PostgreSQL, `thread_id=quote_id`) |
+
+All four services share one PostgreSQL checkpoint store. Thread ID prefix convention
+(`doc_verify_`, `subrogation_`) provides namespace isolation and makes claim history
+queryable across all agents for audit purposes.
+
+### Service Boundaries
+
+Each service is a self-contained deployment unit with:
+- Its own FastAPI application (wrapping the LangGraph `StateGraph`)
+- Its own health check endpoint (`/health` → `{"status": "ok", "graph": "<name>"}`)
+- Its own MCP client configuration (tool endpoint URLs injected via environment)
+- Its own Helm values override block (scaling, resource limits, image tag)
+- Its own service account with least-privilege IAM/RBAC policy
+
+Services do not share in-process state. The only shared infrastructure is:
+- PostgreSQL checkpoint store (all agents)
+- Redis feature store (FNOL and Underwriting only — DocVerification and Subrogation do not hit Redis)
+- Claim store (read-only for all agents; write access scoped per service)
+
+### Per-Substrate Deployment Map (Independent Agents)
+
+| Service | AWS | Azure | OpenShift |
+|---|---|---|---|
+| `doc-verification-agent` | EKS Deployment (LangGraph server) | AKS Deployment (LangGraph server) | OCP Deployment (LangGraph server) |
+| `subrogation-agent` | EKS Deployment (LangGraph server) | AKS Deployment (LangGraph server) | OCP Deployment (LangGraph server) |
+| Event trigger (doc-verify) | SQS → Lambda invokes agent HTTP | Service Bus → Function invokes agent HTTP | OCP Job / Tekton pipeline |
+| Event trigger (subrogation) | SQS → Lambda invokes agent HTTP | Service Bus → Function invokes agent HTTP | OCP Job / Tekton pipeline |
+| MCP servers (`doc-verification-mcp-server`, `claims-data-mcp-server`, `subrogation-mcp-server`) | EKS Deployment | AKS Deployment | OCP Deployment |
+
+### Scaling Configuration
+
+`DocumentVerificationAgent` and `SubrogationAgent` are async, non-customer-facing services.
+Scaling is event-driven, not latency-driven.
+
+| Service | Scaling Driver | Min Replicas | Max Replicas | Notes |
+|---|---|---|---|---|
+| `doc-verification-agent` | SQS/Service Bus queue depth | 1 | 10 | Scale on queue depth > `DOC_VERIFY_QUEUE_DEPTH_THRESHOLD` (config) |
+| `subrogation-agent` | SQS/Service Bus queue depth | 1 | 5 | Lower volume — settlement events are less frequent than FNOL |
+| `fnol-claims-agent` | HTTP request rate (p95 latency) | 2 | 20 | Sync path — scale on latency, not queue depth |
+| `underwriting-quote-agent` | HTTP request rate | 2 | 15 | Sync path |
+
+### Health Check Pattern
+
+All LangGraph services expose a standard health endpoint used by Kubernetes liveness
+and readiness probes:
+
+```python
+@app.get("/health")
+async def health():
+    # Verify checkpoint store connectivity
+    await checkpointer.aget_tuple(config={"configurable": {"thread_id": "health-check"}})
+    return {"status": "ok", "service": os.environ["SERVICE_NAME"]}
+```
+
+Readiness probe also verifies MCP server reachability before accepting traffic:
+
+```python
+@app.get("/ready")
+async def ready():
+    for tool_name, tool_url in mcp_client.tool_registry.items():
+        await mcp_client.ping(tool_url)
+    return {"status": "ready"}
+```
+
+### RemoteGraph Invocation (Pattern B — Future)
+
+When a calling agent requires a synchronous response from `DocumentVerificationAgent`
+(e.g., Underwriting gating issuance on document verification), use `RemoteGraph`:
+
+```python
+from langgraph.pregel.remote import RemoteGraph
+
+doc_verify_agent = RemoteGraph(
+    "doc-verification-agent",
+    url=os.environ["DOC_VERIFY_AGENT_URL"],
+)
+
+result = await doc_verify_agent.ainvoke({
+    "claim_id": state["claim_id"],
+    "doc_refs": state["doc_refs"],
+    "claim_context": state["claim_context"],
+})
+```
+
+`DOC_VERIFY_AGENT_URL` is substrate-specific and injected via Helm values:
+
+| Substrate | `DOC_VERIFY_AGENT_URL` value |
+|---|---|
+| AWS (EKS) | `http://doc-verification-agent.claims.svc.cluster.local:8000` |
+| Azure (AKS) | `http://doc-verification-agent.claims.svc.cluster.local:8000` |
+| OpenShift | `http://doc-verification-agent.claims.svc.cluster.local:8000` |
+
+In-cluster DNS is the same pattern across all three substrates — only the cluster
+domain suffix differs and is transparent to the application.
+
+See [DEC-017](./DECISION_LOG.md#dec-017----event-bus-trigger-vs-remotegraph-invocation-decision-boundary)
+for the decision rule governing when to use event-bus vs `RemoteGraph`.
