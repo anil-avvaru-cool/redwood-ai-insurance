@@ -28,6 +28,8 @@
 11. [Regulatory and Audit Controls](#11-regulatory-and-audit-controls)
 12. [Champion-Challenger for LLMs](#12-champion-challenger-for-llms)
 13. [Substrate Inference Map](#13-substrate-inference-map)
+14. [SGLang as the Structured-Output Inference Engine](#14-sglang-as-the-structured-output-inference-engine)
+15. [Customer-Based Use Cases — vLLM vs SGLang](#15-customer-based-use-cases--vllm-vs-sglang)
 
 ---
 
@@ -52,9 +54,10 @@ OpenAI-compatible endpoint regardless of what is behind it.
 │  Cloud-hosted path         Self-hosted path                  │
 │  ┌──────────────────┐      ┌───────────────────────────────┐ │
 │  │ Bedrock          │      │ vLLM on GPU nodepool          │ │
-│  │ Azure OpenAI     │      │ KServe InferenceService       │ │
-│  │ Anthropic API    │      │ RHOAI / EKS / AKS             │ │
-│  └──────────────────┘      └───────────────────────────────┘ │
+│  │ Azure OpenAI     │      │ SGLang on GPU nodepool        │ │
+│  │ Anthropic API    │      │ KServe InferenceService       │ │
+│  └──────────────────┘      │ RHOAI / EKS / AKS             │ │
+│                             └───────────────────────────────┘ │
 ├──────────────────────────────────────────────────────────────┤
 │  INFRASTRUCTURE SUBSTRATE                                    │
 │  EKS · AKS · OpenShift AI (RHOAI)                           │
@@ -101,6 +104,18 @@ Can LLM inference traffic leave the customer network?
           YES → Pull model at deploy time via initContainer
           NO  → Model must be pre-staged in internal artifact registry
                 (Artifactory / Nexus / S3 internal / ODF)
+
+After selecting the self-hosted path, choose the inference engine:
+     │
+     ├── Primary workload is structured JSON extraction (FNOL detail,
+     │   quote explanation schema, coverage determination)?
+     │    AND running on EKS or AKS (not RHOAI)?
+     │    YES → Deploy SGLang InferenceService alongside vLLM
+     │           (see Section 14 for configuration and decision criteria)
+     │
+     └── Default → vLLM only
+          (long-form generation, investigator summaries, embeddings,
+           RHOAI deployments — vLLM covers all these workloads)
 ```
 
 **Regulated carrier is the design-forcing constraint.** The self-hosted
@@ -705,10 +720,12 @@ officer.
 
 | Inference Component | AWS (EKS) | Azure (AKS) | OpenShift (RHOAI) |
 |---|---|---|---|
-| LLM serving | KServe + vLLM on GPU nodepool | KServe + vLLM on GPU nodepool | RHOAI KServe + vLLM ServingRuntime |
+| LLM serving (generative) | KServe + vLLM on GPU nodepool | KServe + vLLM on GPU nodepool | RHOAI KServe + vLLM ServingRuntime |
 | vLLM container image | `vllm/vllm-openai:latest` (pinned tag) | `vllm/vllm-openai:latest` (pinned) | `quay.io/modh/vllm:rhoai-2.16` |
+| Structured extraction engine | KServe + SGLang (RawDeployment) | KServe + SGLang (RawDeployment) | vLLM guided_json (no SGLang custom runtime by default) |
+| SGLang container image | `lmsysorg/sglang:<pinned>` | `lmsysorg/sglang:<pinned>` | Custom ServingRuntime — platform team approval required |
 | Model storage | S3 (VPC endpoint) | Azure Blob (private endpoint) | ODF S3-compatible (internal) |
-| Embedding model | Same KServe / vLLM pattern | Same | Same |
+| Embedding model | KServe + vLLM (`/v1/embeddings`) | KServe + vLLM (`/v1/embeddings`) | RHOAI KServe + vLLM |
 | Reranker | Self-hosted BGE or Cohere API | Self-hosted BGE or Cohere API | Self-hosted BGE (air-gapped) |
 | Vector store (pgvector) | RDS PostgreSQL | Azure Database for PostgreSQL | CrunchyData PGO |
 | Autoscaling | KEDA + Prometheus | KEDA + Prometheus | OpenShift HPA + user workload monitoring |
@@ -719,6 +736,305 @@ officer.
 **LLM endpoint** (`LLM_BASE_URL`) resolves to a ClusterIP service on all
 three substrates — agents never call a GPU pod directly. KServe manages the
 routing and load-balancing across replicas.
+
+---
+
+## 14. SGLang as the Structured-Output Inference Engine
+
+SGLang (Structured Generation Language) is an inference engine and serving framework optimized for workloads where structured output, shared-prefix caching, and multi-step inference programs are the primary requirements. It exposes an OpenAI-compatible API and is a first-class option in the Redwood inference stack for use cases where vLLM's general-purpose design is not optimal.
+
+### Why SGLang Exists Alongside vLLM
+
+vLLM is the default self-hosted engine. SGLang is added for specific workload characteristics that vLLM serves less efficiently:
+
+| Capability | vLLM | SGLang |
+|---|---|---|
+| Free-form generation (summaries, narratives) | Excellent | Good |
+| Structured JSON output (constrained decoding) | Good — guided decode overhead ~15–30% | Excellent — native, minimal overhead |
+| Shared-prefix KV caching | Block-level prefix cache | RadixAttention — fine-grained radix tree |
+| Embedding model serving | Yes (`/v1/embeddings`) | No — use vLLM for all embedding endpoints |
+| RHOAI / Red Hat validated image | Yes (`quay.io/modh/vllm`) | No — custom `ServingRuntime` required |
+| AWQ quantization | Yes | Limited — verify current SGLang release notes |
+| FP8 / GPTQ quantization | Yes | Yes |
+| Multi-step inference programs | Not native | Yes (`sgl.function` Python frontend) |
+| Production maturity (2026-Q2) | High | Medium-High |
+
+**Rule:** vLLM is the default for all inference workloads. SGLang is deployed only where constrained JSON output or RadixAttention provides a measurable advantage for insurance use cases. Never replace the embedding or reranking `InferenceService` with SGLang — vLLM is the correct engine for those endpoints.
+
+### SGLang Differentiators for Insurance Workloads
+
+**RadixAttention**
+
+Insurance agent workloads share long common prefixes: the same policy document chunk appears in many sequential requests from the same investigator session; the same underwriting rule set is prefixed to every quote explanation request. SGLang's radix tree reuses these prefix KV states across requests at a finer granularity than vLLM's block-aligned cache, reducing time-to-first-token for prefix-heavy workloads by 30–60%.
+
+**Native Constrained Decoding**
+
+FNOL extraction and coverage determination require structured output: claim detail JSON, coverage eligibility flags, risk factor arrays. vLLM's `guided_json` parameter invokes Outlines decoding with measurable per-token overhead; SGLang integrates constraint-guided generation at the engine level. For schemas with 20+ fields, SGLang's structured output throughput is 2–4× higher than vLLM's guided decode mode.
+
+**sgl.function Programs (Optional, Async Only)**
+
+Multi-step extraction (parse → validate → enrich) can be expressed as `sgl.function` programs that run entirely within the SGLang server process, avoiding round-trip latency between steps. This is optional and applies only to the async FNOL extraction pipeline — not the sync agent path.
+
+### SGLang Configuration Reference
+
+SGLang is launched as a Python module. Key parameter names differ from vLLM:
+
+```bash
+python -m sglang.launch_server \
+  --model-path /mnt/models \
+  --served-model-name redwood-extraction-llm \
+  --tensor-parallel-size 1 \
+  --mem-fraction-static 0.85 \
+  --max-prefill-tokens 16384 \
+  --schedule-conservativeness 0.9 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| `--model-path` | Internal registry path | Model weights location (same air-gapped pull pattern as vLLM) |
+| `--served-model-name` | Canonical alias | Agent env var references alias, not model path |
+| `--tensor-parallel-size` | 1 or 2 | Match to GPU allocation per `InferenceService` |
+| `--mem-fraction-static` | `0.85` | Equivalent to vLLM's `--gpu-memory-utilization`; static KV cache allocation |
+| `--max-prefill-tokens` | `16384` | Max tokens processed in a single prefill batch; tune to available VRAM |
+| `--schedule-conservativeness` | `0.9` | Memory reservation margin; increase toward 1.0 if OOM risk is observed |
+| `--enable-torch-compile` | (flag only) | torch.compile kernel optimization — A100/H100 only; skip on V100 or A10G |
+
+**Quantization Note (2026-Q2):** SGLang FP8 quantization is production-ready on A100/H100. AWQ support is present but less battle-tested than vLLM. For memory-constrained nodes where AWQ is required, prefer vLLM. Verify current SGLang release notes before deploying quantized models on SGLang.
+
+### KServe InferenceService — SGLang
+
+SGLang does not have a pre-built KServe `ServingRuntime` on RHOAI (2026-Q2). On EKS and AKS, use a `RawDeployment` InferenceService with a custom container:
+
+```yaml
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: redwood-extraction-llm
+  namespace: inference
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+spec:
+  predictor:
+    containers:
+      - name: kserve-container
+        image: lmsysorg/sglang:v0.4.1-cu124   # pin specific tag; never use :latest
+        command: ["python", "-m", "sglang.launch_server"]
+        args:
+          - "--model-path=/mnt/models"
+          - "--served-model-name=redwood-extraction-llm"
+          - "--tensor-parallel-size=1"
+          - "--mem-fraction-static=0.85"
+          - "--max-prefill-tokens=16384"
+          - "--host=0.0.0.0"
+          - "--port=8080"
+        ports:
+          - containerPort: 8080
+            protocol: TCP
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+            memory: "20Gi"
+            cpu: "4"
+          limits:
+            nvidia.com/gpu: "1"
+            memory: "24Gi"
+        volumeMounts:
+          - name: model-dir
+            mountPath: /mnt/models
+    volumes:
+      - name: model-dir
+        persistentVolumeClaim:
+          claimName: redwood-extraction-model-pvc
+    tolerations:
+      - key: "inference"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+```
+
+**On RHOAI:** SGLang requires a custom `ServingRuntime` resource. Incidents with this runtime are not covered under RHOAI support contracts. Default to vLLM on RHOAI. Only deploy SGLang on RHOAI if the platform team has explicitly approved the custom runtime and accepted the support boundary.
+
+### Environment Variables for SGLang Endpoint
+
+The agent factory (`get_llm()`) requires no changes. Agent nodes that perform structured extraction reference a second env var set pointing to the SGLang endpoint:
+
+```bash
+# Primary LLM — vLLM (long-form generation, investigator summaries)
+LLM_BASE_URL=http://vllm-llm-service.inference.svc.cluster.local:8000/v1
+LLM_MODEL=redwood-llm
+LLM_API_KEY=none
+
+# Extraction LLM — SGLang (structured JSON output)
+EXTRACTION_LLM_BASE_URL=http://sglang-extraction-service.inference.svc.cluster.local:8000/v1
+EXTRACTION_LLM_MODEL=redwood-extraction-llm
+EXTRACTION_LLM_API_KEY=none
+```
+
+Agent nodes that require structured output call via `EXTRACTION_LLM_BASE_URL`. All other nodes use `LLM_BASE_URL`. Both endpoints use the same OpenAI client SDK — the extraction endpoint adds `response_format={"type": "json_schema", ...}` on the client side.
+
+### DNS Naming — SGLang Service
+
+```bash
+# Structured extraction engine (SGLang)
+sglang-extraction-service.inference.svc.cluster.local:8000
+```
+
+The SGLang service lives in the same `inference` namespace as vLLM services. The same `AuthorizationPolicy` (agents and rag namespaces only), mTLS, and `PeerAuthentication: STRICT` apply.
+
+---
+
+## 15. Customer-Based Use Cases — vLLM vs SGLang
+
+Four customer archetypes define the realistic deployment scenarios for the Redwood inference stack. Each maps to a specific inference engine configuration based on regulatory standing, workload shape, and substrate constraints.
+
+---
+
+### Archetype 1: State-Mandated Auto Fund (Regulated, Air-Gapped, RHOAI)
+
+**Profile:** State-operated auto insurance fund under direct DOI oversight. No internet egress permitted. OpenShift AI (RHOAI) on bare-metal or private cloud. Every model inference call is subject to regulatory examination.
+
+**LLM Use Cases:**
+- FNOL narrative inconsistency detection (async batch, nightly runs)
+- Investigator copilot: long-form case summary generation
+- Claim denial letter drafting (long-form; reviewed by human before send)
+
+**Inference Engine: vLLM only**
+
+| Decision Factor | Details |
+|---|---|
+| Platform | RHOAI — vLLM `ServingRuntime` is built-in and Red Hat supported |
+| Model storage | ODF (internal S3-compatible) — no egress required |
+| Quantization | AWQ 4-bit — GPU quota is limited; must fit 13B model on 1× A100 40GB |
+| Air-gapped support | Full — model pre-staged during release pipeline; no runtime egress |
+| SGLang status | Not deployed — no Red Hat validated image; compliance team has not approved custom runtime |
+
+```bash
+LLM_BASE_URL=http://vllm-llm-service.inference.svc.cluster.local:8000/v1
+LLM_MODEL=redwood-llm        # Mistral-7B-Instruct AWQ on single A100 40GB
+LLM_API_KEY=none
+```
+
+All FNOL extraction uses structured prompting with vLLM's `guided_json` parameter and Pydantic validation on the output. The guided decode overhead (~15–30%) is acceptable because FNOL extraction is async — there is no sync SLA for this path.
+
+---
+
+### Archetype 2: Regional P&C Carrier (Semi-Regulated, AWS EKS, Dual-Engine)
+
+**Profile:** Mid-size regional P&C carrier on AWS EKS with GPU nodepool. Sensitive model outputs stay self-hosted; the security team prefers self-hosted for all LLM traffic during the initial deployment phase. Internet egress is allowed but not used for LLM inference.
+
+**LLM Use Cases:**
+- Quote explanation generation — strict JSON: `reason_codes[]`, `risk_factors[]`, `premium_delta`
+- FNOL intake detail extraction — strict JSON: `loss_type`, `vehicle_damage`, `injury_claim`, `witness_count`
+- Investigator copilot: case narrative summary (long-form, free text)
+- Policy coverage Q&A: semi-structured (`coverage_applies: bool` + `rationale: str`)
+
+**Inference Engine: vLLM (generative) + SGLang (structured extraction)**
+
+| InferenceService | Engine | Use Case | Model |
+|---|---|---|---|
+| `redwood-llm` | vLLM | Investigator summaries, copilot long-form | Mistral-7B-Instruct FP16 |
+| `redwood-extraction-llm` | SGLang | FNOL extraction, quote explanation JSON | Mistral-7B-Instruct FP16 |
+| `redwood-embedding` | vLLM | BGE-M3 embeddings for RAG | BGE-M3 |
+
+**Why dual-engine:**
+The quote explanation node has an 8s sync SLA. vLLM's `guided_json` decode overhead pushed p95 latency to ~2.8s for the LLM call alone on a 20-field output schema. SGLang's native constrained decoding holds p95 at ~1.6s for the same schema. FNOL extraction is async but runs at high volume (thousands of claims/hour); SGLang's 2–4× throughput advantage on structured output reduces GPU-hours required. Investigator copilot generates 800–1200 token free-form summaries where vLLM PagedAttention handles concurrent sessions more efficiently than SGLang.
+
+```bash
+LLM_BASE_URL=http://vllm-llm-service.inference.svc.cluster.local:8000/v1
+LLM_MODEL=redwood-llm
+EXTRACTION_LLM_BASE_URL=http://sglang-extraction-service.inference.svc.cluster.local:8000/v1
+EXTRACTION_LLM_MODEL=redwood-extraction-llm
+EMBEDDING_BASE_URL=http://vllm-embedding-service.inference.svc.cluster.local:8000/v1
+EMBEDDING_MODEL=redwood-embedding
+```
+
+---
+
+### Archetype 3: Digital-Native InsurTech (Cloud-Native, Azure, Hybrid)
+
+**Profile:** InsurTech startup offering instant digital quotes. Azure-native. Time-to-market is the primary constraint; self-hosted inference is not required but is evaluated for cost optimization at scale. Primary LLM traffic can egress to Azure OpenAI.
+
+**LLM Use Cases:**
+- High-volume quote explanation: 50,000+ quotes/day, structured JSON output required
+- Coverage chatbot: conversational, free-form responses to policyholder questions
+- Document parsing: policy PDF to structured coverage summary
+
+**Inference Engine: Azure OpenAI (primary) + SGLang on AKS (cost-optimization path)**
+
+| Path | Engine | When Used | Rationale |
+|---|---|---|---|
+| Azure OpenAI GPT-4o | Cloud API | Primary — all production traffic | No GPU management; managed SLA |
+| SGLang on AKS GPU nodepool | Self-hosted | Cost optimization at >40K structured requests/day | Self-hosted TCO below Azure OpenAI per-token cost at this volume |
+
+**Cost decision trigger:** At quote volumes exceeding 40,000/day, Azure OpenAI per-token cost at standard pricing exceeds the amortized cost of a dedicated `Standard_NC24ads_A100_v4` AKS node running SGLang. Re-evaluate the break-even quarterly as Azure OpenAI pricing tiers and reservation discounts change.
+
+**SGLang rationale over vLLM for this archetype:** ~85% of the workload is structured output (quote JSON, coverage determination JSON). SGLang's throughput advantage for constrained decoding is the dominant factor. There is no RHOAI constraint and no AWQ requirement — the A100 80GB fits 7B FP16 with headroom.
+
+```bash
+# Azure OpenAI (primary)
+LLM_BASE_URL=https://<resource>.openai.azure.com/openai/deployments/<deployment>/
+LLM_MODEL=gpt-4o
+LLM_API_KEY=${AZURE_OPENAI_KEY}
+
+# SGLang on AKS (cost-optimization path — activated by EXTRACTION_BACKEND env var)
+EXTRACTION_LLM_BASE_URL=http://sglang-extraction-service.inference.svc.cluster.local:8000/v1
+EXTRACTION_LLM_MODEL=redwood-extraction-llm
+EXTRACTION_LLM_API_KEY=none
+EXTRACTION_BACKEND=azure_openai   # switch to: sglang when cost threshold is crossed
+```
+
+Traffic routing between Azure OpenAI and SGLang is controlled by `EXTRACTION_BACKEND` read in `get_extraction_llm()` — no agent code changes required to switch backends.
+
+---
+
+### Archetype 4: National Multi-Line Carrier (Multi-Substrate, Hybrid Engine Strategy)
+
+**Profile:** Top-10 P&C carrier with multiple lines of business across substrates. Life/health lines on RHOAI (regulatory requirement: data never leaves private cloud). P&C lines on AWS EKS with controlled internet egress. Bedrock available for non-sensitive P&C use cases.
+
+**Use Cases by Line of Business:**
+
+| Line | Use Case | Volume | Latency Requirement |
+|---|---|---|---|
+| Auto P&C | FNOL structured extraction | 200K claims/month | Async |
+| Auto P&C | Quote explanation JSON | 500K quotes/month | Sync, 8s |
+| Auto P&C | Investigator copilot summary | 15K sessions/month | Sync, 10s |
+| Life | Policy coverage analysis (structured) | 50K/month | Async |
+| Health | Prior auth determination (structured) | 80K/month | Async |
+| Shared | Embedding (RAG for all lines) | 2M/day | <30ms |
+
+**Inference Engine Strategy by Substrate:**
+
+| Substrate | Line | Engine | Rationale |
+|---|---|---|---|
+| RHOAI (private cloud) | Life, Health | vLLM only | No SGLang custom runtime approval; Red Hat support boundary |
+| EKS (P&C) | Auto investigator copilot | vLLM | Long-form free-form generation; PagedAttention handles concurrent sessions |
+| EKS (P&C) | Auto FNOL extraction + quote JSON | SGLang | High-volume structured output; 2–4× throughput advantage justifies separate `InferenceService` |
+| EKS (shared) | Embedding (all RAG) | vLLM | SGLang does not serve `/v1/embeddings`; vLLM is the only correct engine here |
+| Bedrock (P&C optional) | Low-stakes coverage Q&A chatbot | Bedrock (Claude Haiku) | Sub-cent cost per interaction; eliminates GPU requirement for conversational path |
+
+**Scale rationale for SGLang on EKS P&C:** At 500K structured quote explanations/month (~17K/day), SGLang's throughput advantage over vLLM guided decode reduces the required GPU replicas from 3 to 2 at peak, saving approximately $4K/month in A100 40GB spot instance cost. The operational cost of a second `InferenceService` is justified only at this volume — below ~10K structured requests/day, vLLM guided decode is adequate and the simpler single-engine deployment is preferred.
+
+**Multi-substrate env var matrix:**
+
+```bash
+# RHOAI substrate (life/health) — vLLM only
+LLM_BASE_URL=http://vllm-llm-service.inference.svc.cluster.local:8000/v1
+LLM_MODEL=redwood-llm-life
+EMBEDDING_BASE_URL=http://vllm-embedding-service.inference.svc.cluster.local:8000/v1
+EMBEDDING_MODEL=redwood-embedding
+
+# EKS substrate (P&C) — vLLM + SGLang
+LLM_BASE_URL=http://vllm-llm-service.inference.svc.cluster.local:8000/v1
+LLM_MODEL=redwood-llm-pc
+EXTRACTION_LLM_BASE_URL=http://sglang-extraction-service.inference.svc.cluster.local:8000/v1
+EXTRACTION_LLM_MODEL=redwood-extraction-llm
+EMBEDDING_BASE_URL=http://vllm-embedding-service.inference.svc.cluster.local:8000/v1
+EMBEDDING_MODEL=redwood-embedding
+```
+
+Different substrates receive different Kubernetes `ConfigMap` / secret values at deploy time. Agent and RAG code is identical across substrates — only env vars change.
 
 ---
 

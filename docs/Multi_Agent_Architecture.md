@@ -26,6 +26,7 @@
 10. [Deployment Mapping](#10-deployment-mapping)
 11. [MCP Tool Layer](#11-mcp-tool-layer)
 12. [Agent-to-Agent Integration Patterns](#12-agent-to-agent-integration-patterns)
+13. [TigerGraph — Graph Scaling Path](#13-tigergraph--graph-scaling-path)
 
 ---
 
@@ -1096,6 +1097,129 @@ inter-agent call mechanism. It preserves checkpoint isolation, HITL support, and
 substrate portability without additional infrastructure.
 
 See [DEC-017](./DECISION_LOG.md#dec-017----event-bus-trigger-vs-remotegraph-invocation-decision-boundary) for full rationale.
+
+---
+
+---
+
+## 13. TigerGraph — Graph Scaling Path
+
+The current architecture commits to Neo4j (local/OCP), Amazon Neptune (AWS), and
+Cosmos DB Gremlin (Azure) for all graph queries. This section documents the
+architectural threshold at which TigerGraph becomes the correct substrate, and
+exactly what changes when that threshold is crossed.
+
+### The Specific Problem: Insurance Fraud Ring Structure
+
+Insurance fraud graphs are not social graphs. They are heterogeneous multi-entity
+graphs where a single fraud ring spans claimants, vehicles, accidents, repair shops,
+medical providers, billing entities, and attorneys — each connected by different edge
+types. A full ring detection traversal looks like this:
+
+```
+Claimant A ──── involved_in ───→ Accident X ←─── involved_in ──── Claimant B
+     │                                                                    │
+     ├── treated_by ──→ Medical Provider M ←── treated_by ───────────────┘
+     │                         │
+     │               bills_through ──→ Billing Entity B
+     │                                       │
+     │                         shares_TIN_with ──→ Provider N  ← [known fraud flag]
+     │
+     ├── represented_by ──→ Attorney L ←── represented_by ──── Claimant B
+     │
+     └── vehicle_repaired_by ──→ Repair Shop R
+                                       │
+                              estimated_by ──→ Adjuster J ← [flagged ring member]
+```
+
+This is a **6–7 hop traversal** across heterogeneous edge types. In the current
+architecture, the sync path (`graph_query_node`) handles 1–2 hop neighborhood
+lookups — fast enough for sub-65ms scoring. The `deep_graph_node` in the async
+path currently targets 3+ hop ring expansion.
+
+**The scaling pressure point:** as the cumulative entity graph grows to hundreds of
+millions of nodes (policies, persons, vehicles, providers, shops, attorneys, billing
+entities) under 100K+ daily claims, Neo4j's query planner — which optimizes for OLTP-style
+lookups — hits traversal limits that the async enrichment SLA cannot absorb. A 6+ hop
+pattern match against a 500M-node graph under concurrent load produces full-graph scans,
+not index-bounded traversals.
+
+### Why TigerGraph Fits This Workload
+
+TigerGraph uses a **Native Parallel Graph (NPG) engine**: queries are compiled to
+parallel execution plans distributed across the graph's partition map. The execution
+model is fundamentally different from Neo4j's single-planner approach.
+
+| Dimension | Neo4j (current) | TigerGraph (candidate) |
+|---|---|---|
+| Query language | Cypher | GSQL (procedural, compiled to parallel plan) |
+| Traversal model | Iterative, single-planner | Distributed parallel execution across partitions |
+| Optimal hop depth | 1–3 hops | 5–10+ hops across billions of edges |
+| Graph size sweet spot | Tens of millions of nodes | Hundreds of millions to billions |
+| Insurance fraud OOTB | Manual Cypher ring queries | Fraud detection starter kit (ring detection, money flow, shared identity) |
+| Streaming ingest | Kafka connector | Native Kafka connector + CDC; supports concurrent ingest + query |
+| Cloud-native maturity | Mature (OCP operator, Neptune, Cosmos) | Growing (TigerGraph Cloud on AWS/Azure; Helm chart, no dedicated OCP operator) |
+
+TigerGraph's **fraud detection starter kit** is particularly relevant: pre-built GSQL
+queries for shared identity detection (same address/phone/SSN across policies), money
+flow ring tracing, and provider billing cluster analysis. These patterns map directly
+to the staged accident, owner give-up, and medical billing fraud categories that
+drive SIU referrals in this platform.
+
+### What Changes — and What Doesn't
+
+Only the graph substrate in the **Business Logic / ML layer** changes. The
+LangGraph orchestration, node signatures, and state schema are unaffected.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  BUSINESS LOGIC / ML LAYER — Pure Python + Pydantic             │
+│  graph queries ← CHANGE: pyTigerGraph replaces neo4j-driver     │
+│                           GSQL replaces Cypher                  │
+│  XGBoost scoring · feature store · entity resolution ← unchanged│
+│  regulatory mask · SHAP explainability              ← unchanged  │
+│  NO LangChain imports in this layer                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Concretely:
+- `graph_query_node` and `deep_graph_node` swap `neo4j` driver for `pyTigerGraph` client
+- GSQL ring detection queries replace Cypher traversals
+- `FNOLState.graph_context: dict[str, Any]` is substrate-agnostic — the field and its
+  downstream consumers (tabular scoring, SHAP, audit) do not change
+- The layer boundary rule holds: the graph client lives in the Business Logic layer.
+  No LangGraph node imports the graph driver directly
+
+**Deployment mapping change:**
+
+| Environment | Graph Substrate (current) | Graph Substrate (TigerGraph path) |
+|---|---|---|
+| AWS | Amazon Neptune (Gremlin) | TigerGraph Cloud (AWS-hosted) or self-managed EC2 cluster |
+| Azure | Cosmos DB (Gremlin) | TigerGraph Cloud (Azure-hosted) |
+| OpenShift | Neo4j Operator | TigerGraph Helm chart (no dedicated OCP operator — operational gap) |
+
+### Migration Trigger Criteria
+
+Do not migrate speculatively. Migrate when **all three** conditions are met:
+
+1. **Entity graph scale:** cumulative graph exceeds ~200M nodes with active concurrent
+   ring detection queries
+2. **SLA breach:** `deep_graph_node` async p95 latency regularly exceeds the enrichment
+   budget; `neo4j EXPLAIN` shows full-graph scans on ring detection patterns
+3. **Ring complexity:** production SIU referrals require 6+ hop traversals to close
+   false-negative gaps that 3-hop Neo4j queries miss
+
+Until then, Neo4j covers the current workload and avoids the operational cost of
+running a TigerGraph cluster alongside the existing substrates.
+
+### What Stays the Same
+
+- LangGraph `StateGraph` topology — no change
+- HITL interrupt pattern — no change
+- All MCP tool contracts — no change
+- `FNOLState` schema — no change
+- Sync path is not affected: 1–2 hop sync queries continue to run against the
+  existing graph substrate; TigerGraph migration targets the async `deep_graph_node` first
 
 ---
 
