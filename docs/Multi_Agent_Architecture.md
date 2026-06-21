@@ -41,6 +41,7 @@
 12. [Agent-to-Agent Integration Patterns](#12-agent-to-agent-integration-patterns)
 13. [TigerGraph — Graph Scaling Path](#13-tigergraph--graph-scaling-path)
 14. [Evaluation and Observability](#14-evaluation-and-observability)
+15. [Loop Prevention and Cost Guards](#15-loop-prevention-and-cost-guards)
 
 ---
 
@@ -1650,6 +1651,552 @@ export job picks it up, applies PII masking, and pushes to Braintrust.
 | LangSmith as production monitor | LangSmith is a run-level debugger, not a time-series drift monitor. Use Phoenix for distribution tracking. |
 | Helicone / PromptLayer | Proxy-based interceptors break LangGraph's async streaming guarantees. |
 | Weights & Biases (W&B) ML monitoring | W&B is the right tool for XGBoost model tracking (already in scope for the tabular layer). Do not conflate ML model monitoring with LLM eval — they are separate pipelines with separate toolchains. |
+
+---
+
+---
+
+## 15. Loop Prevention and Cost Guards
+
+Four distinct failure modes can cause a graph to run indefinitely or accumulate
+unbounded cost. Each requires a different guard. None of them are handled
+automatically by LangGraph.
+
+---
+
+### 15a. LangGraph Recursion Limit
+
+LangGraph enforces a step ceiling via `recursion_limit` in `RunnableConfig`.
+The default is 25 steps. It applies per `invoke` / `ainvoke` call — not per
+node type — and counts every node execution including parallel fan-out branches.
+
+**Set it explicitly on every graph invocation. Do not rely on the default.**
+
+```python
+# FNOL sync graph — tight budget: intake → routing → decision is 6–8 nodes
+result = fnol_app.invoke(
+    input_payload,
+    config={
+        "configurable": {"thread_id": claim_id},
+        "recursion_limit": 15,          # configured in config.py, not hardcoded
+    },
+)
+
+# FNOL async graph — longer path: enrichment fan-out + rescore + audit
+result = fnol_async_app.invoke(
+    None,                               # resume from checkpoint
+    config={
+        "configurable": {"thread_id": claim_id},
+        "recursion_limit": 20,
+    },
+)
+```
+
+**Per-graph recursion budgets (config-driven):**
+
+| Graph | Env Var | Recommended Ceiling | Rationale |
+|---|---|---|---|
+| FNOL sync | `FNOL_SYNC_RECURSION_LIMIT` | 15 | 6–8 nodes typical; 15 gives headroom for retries |
+| FNOL async | `FNOL_ASYNC_RECURSION_LIMIT` | 20 | Enrichment fan-out (4 parallel) + rescore + audit |
+| Underwriting | `UW_RECURSION_LIMIT` | 15 | Linear path; parallelism is 2 nodes wide |
+| DocumentVerification | `DOC_VERIFY_RECURSION_LIMIT` | 12 | Fan-out (3 nodes) + decision + audit |
+| Subrogation | `SUBROGATION_RECURSION_LIMIT` | 15 | Fan-out (2 nodes) + estimation + referral |
+
+When `recursion_limit` is hit, LangGraph raises `GraphRecursionError`. Catch
+it at the service boundary and route to the audit node outside the graph:
+
+```python
+from langgraph.errors import GraphRecursionError
+
+try:
+    result = app.invoke(payload, config=config)
+except GraphRecursionError:
+    logger.error("recursion_limit exceeded", extra={"claim_id": claim_id})
+    audit_store.write_abort(claim_id, reason="RECURSION_LIMIT_EXCEEDED")
+    raise
+```
+
+---
+
+### 15b. Async Rescore Cycle Guard
+
+The FNOL async graph contains the only structural cycle in this architecture:
+`async_rescore_node` can trigger an escalation that re-enters `decision_routing_node`.
+The LangGraph recursion limit is a backstop, not the primary guard.
+
+**Add `rescore_count: int` to `FNOLState` and enforce a ceiling in the
+conditional edge, before the graph runtime gets involved:**
+
+```python
+# State schema addition
+class FNOLState(TypedDict):
+    ...
+    rescore_count: int                 # incremented each time async_rescore_node runs
+```
+
+```python
+# async_rescore_node — increment counter before routing
+def async_rescore_node(state: FNOLState) -> FNOLState:
+    ...
+    return {**state, "rescore_count": state.get("rescore_count", 0) + 1}
+```
+
+```python
+# Conditional edge out of async_rescore_node
+def route_after_rescore(state: FNOLState) -> str:
+    max_rescores = int(os.environ["FNOL_MAX_RESCORE_CYCLES"])   # default: 1
+    score_delta = (state.get("async_fraud_score") or 0) - state["sync_fraud_score"]
+
+    if state["rescore_count"] >= max_rescores:
+        return "audit_node"            # ceiling hit — terminate regardless of delta
+
+    if score_delta > float(os.environ["RESCORE_ESCALATION_THRESHOLD"]):
+        return "decision_routing_node" # escalate tier
+    return "audit_node"               # no significant change — terminate
+```
+
+**Why the ceiling is 1 by default:** In production, async enrichment data
+arrives once — there is no second batch of evidence that would justify a second
+rescore cycle within the same claim event. A `rescore_count > 1` almost always
+indicates a logic error, not a legitimate multi-round enrichment scenario.
+
+---
+
+### 15c. Per-Call Token Limit
+
+`max_tokens` must be set on every `BaseChatModel` instance. Without it, an
+adversarial or malformed input can cause the LLM to generate until its own
+context window is exhausted — burning cost and blocking the node indefinitely.
+
+**Add `max_tokens` to the `get_llm()` factory:**
+
+```python
+def get_llm(max_tokens: int | None = None) -> BaseChatModel:
+    provider = os.environ["LLM_PROVIDER"]
+    token_limit = max_tokens or int(os.environ["LLM_DEFAULT_MAX_TOKENS"])
+
+    if provider == "bedrock":
+        return ChatBedrock(
+            model_id=os.environ["BEDROCK_MODEL_ID"],
+            model_kwargs={"max_tokens": token_limit},
+        )
+    elif provider == "azure_openai":
+        return AzureChatOpenAI(
+            deployment_name=os.environ["AZURE_OPENAI_DEPLOYMENT"],
+            max_tokens=token_limit,
+        )
+    elif provider == "vllm":
+        return ChatOpenAI(
+            base_url=os.environ["VLLM_BASE_URL"],
+            api_key="none",
+            max_tokens=token_limit,
+        )
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider}")
+```
+
+**Per-node token budgets (env var, not hardcoded):**
+
+| Node | Env Var | Recommended Ceiling | Rationale |
+|---|---|---|---|
+| `narrative_llm_node` | `NARRATIVE_LLM_MAX_TOKENS` | 1024 | Structured verdict + 2–3 sentence explanation |
+| `quote_gen_node` | `QUOTE_GEN_MAX_TOKENS` | 2048 | Customer-facing explanation can be longer |
+| `investigator_copilot_node` | `COPILOT_MAX_TOKENS` | 1500 | Case summary + SHAP rendering + checklist |
+
+Nodes call `get_llm(max_tokens=int(os.environ["NARRATIVE_LLM_MAX_TOKENS"]))` —
+not the default factory — so the ceiling is node-specific.
+
+---
+
+### 15d. Message History Growth
+
+`messages: Annotated[list[BaseMessage], add_messages]` accumulates every LLM
+turn across the full graph run. For graphs that suspend at HITL interrupts for
+hours or days, then resume, the message list grows unbounded. A long-suspended
+FNOL claim with multiple investigator interactions can carry a message list large
+enough to exceed the model's context window on the next `invoke`.
+
+**Trim the message list at HITL resume, not inside graph nodes:**
+
+```python
+# At the service layer — before invoking the resumed graph
+from langchain_core.messages import SystemMessage, HumanMessage
+
+MAX_MESSAGES = int(os.environ["LLM_MAX_MESSAGE_HISTORY"])   # default: 20
+
+current_state = app.get_state(config={"configurable": {"thread_id": claim_id}})
+messages = current_state.values.get("messages", [])
+
+if len(messages) > MAX_MESSAGES:
+    # Keep the system message (index 0) + the most recent N-1 messages
+    trimmed = [messages[0]] + messages[-(MAX_MESSAGES - 1):]
+    app.update_state(
+        config={"configurable": {"thread_id": claim_id}},
+        values={"messages": trimmed},
+    )
+
+result = app.invoke(None, config={"configurable": {"thread_id": claim_id}})
+```
+
+**Why trim at resume, not inside a node:** Trimming inside a node modifies
+state mid-graph, which can cause checkpoint inconsistency if the trim and the
+subsequent LLM call are not atomic. At resume, the state update is committed
+to the checkpoint store before `invoke` starts — it is a clean boundary.
+
+---
+
+### 15e. Per-Claim Cost Ceiling
+
+§14d monitors `copilot.token_cost_usd` and alerts when it exceeds $0.05 per
+invocation. Monitoring detects; it does not prevent. A cost ceiling enforced
+in state terminates the graph before the budget is crossed.
+
+**Add `llm_cost_usd: float` to each state schema and check it at every LLM
+node entry:**
+
+```python
+# State schema addition (all four state schemas)
+class FNOLState(TypedDict):
+    ...
+    llm_cost_usd: float                # accumulated LLM spend for this claim run
+```
+
+```python
+# Shared utility — call at the top of every LLM node
+def check_cost_ceiling(state: FNOLState, node_name: str) -> None:
+    ceiling = float(os.environ["CLAIM_LLM_COST_CEILING_USD"])
+    if state.get("llm_cost_usd", 0.0) >= ceiling:
+        raise CostCeilingExceeded(
+            f"{node_name}: accumulated cost ${state['llm_cost_usd']:.4f} "
+            f"exceeds ceiling ${ceiling:.4f}"
+        )
+
+# After each LLM call — accumulate actual token cost from response metadata
+def accumulate_cost(state: dict, response: BaseMessage) -> dict:
+    usage = response.response_metadata.get("usage", {})
+    cost = estimate_cost_usd(
+        prompt_tokens=usage.get("input_tokens", 0),
+        completion_tokens=usage.get("output_tokens", 0),
+        model=os.environ["BEDROCK_MODEL_ID"],   # or deployment name
+    )
+    return {**state, "llm_cost_usd": state.get("llm_cost_usd", 0.0) + cost}
+```
+
+`CostCeilingExceeded` is caught at the service boundary — same handler as
+`GraphRecursionError` — and routes to the audit node outside the graph.
+
+**Recommended ceilings (config-driven):**
+
+| Graph | Env Var | Recommended Ceiling |
+|---|---|---|
+| FNOL (full async path) | `FNOL_LLM_COST_CEILING_USD` | $0.10 |
+| Underwriting | `UW_LLM_COST_CEILING_USD` | $0.15 (quote_gen uses RAG + LLM) |
+| DocumentVerification | `DOC_VERIFY_LLM_COST_CEILING_USD` | $0.05 (no LLM node currently) |
+| Subrogation | `SUBROGATION_LLM_COST_CEILING_USD` | $0.05 (no LLM node currently) |
+
+---
+
+### 15f. Node Idempotency — No Retry on Same Parameters
+
+When LangGraph replays a node from a checkpoint (transient infra failure,
+pod restart, job retry), any node that calls an external system — MCP tools,
+LLM providers, third-party APIs — will re-issue the same call unless the node
+checks whether its output field is already populated.
+
+**Every node that writes to a state field must check that field before executing:**
+
+```python
+# photo_auth_node — idempotent MCP call
+async def photo_auth_node(state: DocVerificationState) -> DocVerificationState:
+    if state.get("photo_auth_result") is not None:
+        return state                   # already computed on a prior execution — skip
+
+    try:
+        result = await mcp_client.call_tool("exif_analyzer", {...})
+        photo_auth = await mcp_client.call_tool("perceptual_hash_checker", {...})
+    except ToolDependencyError:
+        return {**state, "photo_auth_result": {"status": "SERVICE_UNAVAILABLE"}}
+
+    return {**state, "photo_auth_result": result}
+```
+
+This applies to all nodes that call external systems:
+
+| Node | Output Field to Check | External Call |
+|---|---|---|
+| `photo_auth_node` | `photo_auth_result` | MCP: `exif_analyzer`, `perceptual_hash_checker` |
+| `estimate_check_node` | `estimate_check_result` | MCP: `repair_estimate_validator` |
+| `narrative_check_node` | `narrative_check_result` | MCP: `narrative_consistency_checker` |
+| `liability_scoring_node` | `liability_assessment` | MCP: `police_report_api`, `telematics_crash_query` |
+| `evidence_assembly_node` | `evidence_refs` | MCP: `evidence_collector` |
+| `mvr_pull_node` | `mvr_result` | External: DMV / LexisNexis |
+| `credit_pull_node` | `credit_score` | External: credit bureau |
+| `narrative_llm_node` | `narrative_analysis` (in messages) | LLM |
+| `quote_gen_node` | `quote_explanation` | LLM + RAG |
+
+**What this is not:** This is not a retry policy. If a tool returns
+`SERVICE_UNAVAILABLE`, the node writes that status to state and exits — it does
+not retry. Retry logic for transient failures belongs in the MCP client transport
+layer (e.g., exponential backoff with 2 attempts), not in the graph node. The
+node's idempotency check protects against checkpoint replay, not against
+transient upstream failures.
+
+---
+
+### 15g. Guard Hierarchy Summary
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  SERVICE BOUNDARY — catch GraphRecursionError, CostCeilingExceeded│
+│  Route to audit store. Do not re-raise into the HTTP response.   │
+├──────────────────────────────────────────────────────────────────┤
+│  GRAPH INVOCATION — recursion_limit in RunnableConfig            │
+│  Hard ceiling on total step count. Set per graph, not default.   │
+├──────────────────────────────────────────────────────────────────┤
+│  CONDITIONAL EDGE — rescore_count check (FNOL async only)        │
+│  Terminates the rescore cycle before the recursion limit fires.  │
+├──────────────────────────────────────────────────────────────────┤
+│  LLM NODE ENTRY — check_cost_ceiling()                           │
+│  Aborts before the LLM call if accumulated spend exceeds budget. │
+├──────────────────────────────────────────────────────────────────┤
+│  LLM CALL — max_tokens on BaseChatModel                          │
+│  Caps a single response. Prevents per-call runaway.              │
+├──────────────────────────────────────────────────────────────────┤
+│  NODE ENTRY — idempotency check on output field                  │
+│  Prevents re-issuing external calls on checkpoint replay.        │
+├──────────────────────────────────────────────────────────────────┤
+│  PRE-CALL — input filtering (score gate, min-length gate)        │
+│  Skips LLM call entirely when signal does not justify it.        │
+├──────────────────────────────────────────────────────────────────┤
+│  LLM CALL — prompt caching (static prefix)                       │
+│  Reduces input token cost 50–90% on repeated system prompts.     │
+├──────────────────────────────────────────────────────────────────┤
+│  LLM CALL — response length constraints (prompt-level)           │
+│  Eliminates token waste before structured output begins.         │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Each guard has a distinct scope and failure mode it owns. They are
+complementary — the idempotency check cannot substitute for `recursion_limit`,
+and `recursion_limit` cannot substitute for the rescore cycle counter.
+
+---
+
+### 15h. LLM Call Optimization — Prompt Caching, Input Filtering, Response Constraints
+
+The guards in §15a–15g prevent unbounded loops and cost overruns. This section
+addresses the complementary goal: reducing the cost and latency of LLM calls
+that legitimately run. Three techniques apply here. They are independent and can
+be adopted in any order.
+
+---
+
+#### Prompt Caching
+
+The three LLM nodes share a structural property: each has a large, static system
+prompt (claim handling rules, policy document fragments from RAG, SHAP rendering
+instructions) that is identical across every invocation. Only the per-claim
+content (narrative text, feature values, retrieved documents) changes. This is
+the exact workload prompt caching is designed for.
+
+**How each substrate handles it:**
+
+| Substrate | Mechanism | Code change required |
+|---|---|---|
+| Bedrock (Claude) | `cache_control` block in `model_kwargs` — marks the static prefix as cacheable. Cache TTL: 5 minutes. | Yes — add `cache_control` to system message |
+| Azure OpenAI | Automatic prefix caching for prompts ≥1024 tokens. No opt-in required. | None |
+| vLLM | KV prefix cache — enabled by default when `--enable-prefix-caching` is set at server startup. | Server config only |
+
+**Bedrock implementation — update `get_llm()` and node prompt construction:**
+
+```python
+# agents/nodes/narrative_llm_node.py
+
+from langchain_core.messages import SystemMessage
+from langchain_aws import ChatBedrock
+
+# Mark the static system prompt as the cacheable prefix.
+# The per-claim HumanMessage is sent after and is NOT cached.
+NARRATIVE_SYSTEM_PROMPT = SystemMessage(
+    content=[
+        {
+            "type": "text",
+            "text": NARRATIVE_SYSTEM_PROMPT_TEXT,   # static — loaded from template file
+            "cache_control": {"type": "ephemeral"},  # Bedrock cache directive
+        }
+    ]
+)
+
+async def narrative_llm_node(state: FNOLState) -> FNOLState:
+    llm = get_llm(max_tokens=int(os.environ["NARRATIVE_LLM_MAX_TOKENS"]))
+    chain = NARRATIVE_SYSTEM_PROMPT | llm | parser
+    result = await chain.ainvoke({"narrative": state["fnol_payload"]["narrative"]})
+    ...
+```
+
+The cached prefix covers everything that does not change per claim — system
+instructions, output schema definition, few-shot examples. Only the claim
+narrative content varies and is sent uncached.
+
+**Expected savings:**
+
+| Node | Static system prompt size | Estimated input token reduction per call |
+|---|---|---|
+| `narrative_llm_node` | ~800–1200 tokens (rules + schema) | 60–80% |
+| `quote_gen_node` | ~1500–2500 tokens (RAG docs + schema) | 70–90% |
+| `investigator_copilot_node` | ~1000–1500 tokens (SHAP rendering + checklist template) | 65–85% |
+
+At 100K claims/day with a 40% async LLM hit rate, the `narrative_llm_node`
+alone accounts for ~40K cached calls/day. Savings compound at volume.
+
+**Design decisions:**
+- Cache the system message, not the full prompt. The claim narrative must be
+  uncached — caching it would cause the model to return a stale analysis from
+  a prior claim's context.
+- Bedrock cache TTL is 5 minutes. For nodes invoked at sustained volume (>1
+  call per 5 minutes), the cache is effectively always warm. For low-volume
+  nodes, the cost benefit diminishes but there is no penalty for cache misses —
+  the full prompt is sent as a fallback.
+- Azure OpenAI and vLLM require no code changes for caching. The Bedrock
+  `cache_control` block is the only substrate-specific implementation.
+
+---
+
+#### Input Filtering — Score Gate and Minimum Signal Check
+
+`narrative_llm_node` currently runs on every claim that reaches the FNOL async
+path. STP claims (`sync_fraud_score < 0.25`) already bypass the async path
+entirely via the sync graph's `stp_node`. However, low-medium confidence claims
+in the 0.25–0.40 range enter the async path but carry insufficient fraud signal
+to justify an LLM narrative analysis — their rescore delta will be negligible
+regardless of the narrative consistency verdict.
+
+Two gates at `narrative_llm_node` entry:
+
+```python
+async def narrative_llm_node(state: FNOLState) -> FNOLState:
+    # Gate 1 — score threshold: skip LLM if fraud signal is too weak
+    score_gate = float(os.environ["NARRATIVE_LLM_SCORE_GATE"])   # default: 0.40
+    if state["sync_fraud_score"] < score_gate:
+        logger.info(
+            "narrative_llm_node skipped: score below gate",
+            extra={"claim_id": state["claim_id"], "score": state["sync_fraud_score"]},
+        )
+        return state   # narrative_analysis remains absent — feedback_node handles None
+
+    # Gate 2 — minimum narrative length: LLM consistency check requires substance
+    narrative = state["fnol_payload"].get("narrative", "")
+    min_words = int(os.environ["NARRATIVE_LLM_MIN_WORDS"])        # default: 30
+    if len(narrative.split()) < min_words:
+        logger.info(
+            "narrative_llm_node skipped: narrative too short for consistency check",
+            extra={"claim_id": state["claim_id"], "word_count": len(narrative.split())},
+        )
+        return state
+
+    # Proceed with LLM call
+    ...
+```
+
+**Gate configuration:**
+
+| Env Var | Default | Rationale |
+|---|---|---|
+| `NARRATIVE_LLM_SCORE_GATE` | `0.40` | Claims below 0.40 are unlikely to escalate on narrative evidence alone; SIU referral threshold is 0.60 |
+| `NARRATIVE_LLM_MIN_WORDS` | `30` | Sub-30-word narratives ("car hit a pole") have no consistency signal to extract |
+
+**`investigator_copilot_node` is already gated** — it only executes for claims
+that reach the HITL interrupt (`score ≥ 0.25`). STP claims never reach it.
+No additional gate is needed there.
+
+**`quote_gen_node` is not gated** — quote explanation is a customer-facing
+deliverable required for every converted quote regardless of risk tier.
+
+**Design decisions:**
+- Both gates write a log entry but do not write a `FLAG` or error to state.
+  The absence of `narrative_analysis` in state is a valid outcome — `feedback_node`
+  already handles a `None` value for that field (see §14e).
+- The score gate threshold (`0.40`) is deliberately below the SIU referral
+  threshold (`0.60`). This preserves LLM analysis for mid-range cases where
+  a narrative inconsistency could be the deciding signal in a review.
+- Do not gate `narrative_llm_node` on `risk_tier` — tier is a derived label,
+  not a raw signal. Gate on the continuous score to avoid threshold-boundary
+  artifacts.
+
+---
+
+#### Response Length Constraints — Prompt-Level Enforcement
+
+§15c sets `max_tokens` on `BaseChatModel` — this caps the response at the API
+level. A complementary gap remains: the model may generate preamble text
+("Certainly, here is the analysis...") before the structured JSON output begins,
+consuming tokens that `PydanticOutputParser` discards. At scale, this is
+measurable waste.
+
+Add an explicit output format instruction to the system prompt of every LLM node:
+
+```python
+# Template fragment — add to the end of each node's system prompt
+
+OUTPUT_FORMAT_INSTRUCTION = """
+Respond with ONLY a valid JSON object conforming to the schema below.
+Do not include any preamble, explanation, or text outside the JSON object.
+"""
+```
+
+**Per-node prompt additions:**
+
+| Node | Instruction to add | Impact |
+|---|---|---|
+| `narrative_llm_node` | "Respond with ONLY a JSON object: `{\"narrative_verdict\": ..., \"explanation\": ...}`" | Eliminates narrative prose before the verdict |
+| `quote_gen_node` | "Respond with ONLY a JSON object: `{\"quote_explanation\": ...}`" | The explanation field itself can be verbose; preamble before it is pure waste |
+| `investigator_copilot_node` | "Respond with ONLY a JSON object: `{\"case_summary\": ..., \"evidence_checklist\": [...], \"suggested_actions\": [...]}`" | Checklist items inflate quickly without format enforcement |
+
+**Combined effect with `max_tokens`:**
+
+```
+Without prompt instruction:
+  "Certainly! Based on my analysis of the claim narrative, I found the following
+   inconsistencies worth noting: {JSON begins here}"
+  → ~30 wasted tokens per call before PydanticOutputParser reaches usable content
+
+With prompt instruction:
+  "{JSON begins here}"
+  → 0 wasted tokens; parser receives clean input; smaller completion budget needed
+```
+
+At 40K `narrative_llm_node` calls/day, eliminating 30 tokens per call saves
+~1.2M completion tokens/day — roughly 10–15% of per-node completion spend,
+in addition to the prompt caching savings on input tokens.
+
+**Design decisions:**
+- Prompt-level instruction is the primary enforcement. `max_tokens` is the
+  backstop for adversarial or malformed inputs that ignore the instruction.
+  Both are needed — neither alone is sufficient.
+- Do not use output format instructions to reduce `max_tokens` ceilings
+  proportionally. Keep the ceilings from §15c as-is; the instruction reduces
+  average-case spend, not worst-case spend.
+- For `quote_gen_node` specifically, the `quote_explanation` field content is
+  intentionally verbose (customer-facing). The instruction eliminates preamble
+  only — it does not shorten the explanation itself. Do not add word-count
+  constraints to the explanation content.
+
+---
+
+**Combined optimization summary:**
+
+| Technique | Applies To | Cost Impact | Latency Impact |
+|---|---|---|---|
+| Prompt caching | All three LLM nodes | 60–90% reduction on input tokens | Slight reduction (cached prefix skips tokenization) |
+| Score gate | `narrative_llm_node` | Skips call entirely for low-score claims (~20–30% of async path) | Full node latency eliminated for gated claims |
+| Min-length gate | `narrative_llm_node` | Skips call for thin narratives | Full node latency eliminated for gated claims |
+| Response format instruction | All three LLM nodes | ~10–15% reduction on completion tokens | Marginal |
+
+These three techniques are additive. Apply prompt caching first — it has the
+largest impact and the smallest implementation surface (Bedrock only requires a
+`cache_control` block; Azure and vLLM require no code changes). Add input
+filtering next — it is a pure conditional, no LLM provider dependency. Add
+response format instructions last — they are prompt changes that require
+Braintrust eval re-run before deploy (§14c).
 
 ---
 
