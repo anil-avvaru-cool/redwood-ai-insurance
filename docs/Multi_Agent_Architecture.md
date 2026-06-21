@@ -11,6 +11,19 @@
 
 ---
 
+> **Architecture Pattern: Choreographed Specialist Network**
+> Four independent LangGraph services (FNOL, Underwriting, DocumentVerification, Subrogation),
+> each owning a bounded claim lifecycle domain. There is no central coordinator and no LLM
+> planner — routing is deterministic Python (score thresholds, config-driven). Agents are
+> triggered by domain lifecycle events (SQS / Azure Service Bus / OCP Job) rather than by
+> a central orchestrator telling them what to do. LLM capability is injected only at specific
+> leaf nodes (`narrative_llm_node`, `quote_gen_node`, `investigator_copilot_node`); it never
+> controls graph topology. This is **choreography over orchestration**: each agent reacts to
+> an event on its own lifecycle boundary, with inter-agent calls handled by Pattern A
+> (event-bus fire-and-forget) or Pattern B (RemoteGraph synchronous subgraph call). See §12.
+
+---
+
 ## Table of Contents
 1. [Layer Separation](#1-layer-separation)
 2. [FNOL Multi-Agent System](#2-fnol-multi-agent-system)
@@ -27,6 +40,7 @@
 11. [MCP Tool Layer](#11-mcp-tool-layer)
 12. [Agent-to-Agent Integration Patterns](#12-agent-to-agent-integration-patterns)
 13. [TigerGraph — Graph Scaling Path](#13-tigergraph--graph-scaling-path)
+14. [Evaluation and Observability](#14-evaluation-and-observability)
 
 ---
 
@@ -1220,6 +1234,422 @@ running a TigerGraph cluster alongside the existing substrates.
 - `FNOLState` schema — no change
 - Sync path is not affected: 1–2 hop sync queries continue to run against the
   existing graph substrate; TigerGraph migration targets the async `deep_graph_node` first
+
+---
+
+---
+
+## 14. Evaluation and Observability
+
+> **Scope of this section:** The tabular ML layer (XGBoost, feature store, SHAP) already
+> has a signal path: override rates flow back to `feedback_node`, and the label store
+> triggers retraining eligibility checks. This section covers the **LLM node layer only**
+> — `narrative_llm_node`, `quote_gen_node`, `investigator_copilot_node` — which produce
+> unstructured outputs with no existing quality signal.
+
+**Critical constraint:** No PII in any eval log, trace, or dataset. All claim identifiers
+logged to external services must use `claim_id` / `quote_id` only. Raw narratives,
+claimant names, SSNs, and policy numbers must be masked before export. See masking
+rules in [DEC-020](./DECISION_LOG.md#dec-020) (to be added).
+
+---
+
+### 14a. Scope — What Gets Evaluated
+
+| Node | Output Type | Existing Signal | Eval Gap |
+|---|---|---|---|
+| `narrative_llm_node` | Narrative consistency verdict + explanation | None | Is the LLM flagging real inconsistencies or hallucinating? |
+| `quote_gen_node` | Customer-facing quote explanation | None | Does explanation accurately reflect risk score and policy terms? |
+| `investigator_copilot_node` | Case summary + SHAP rendering + evidence checklist | Override rate (indirect) | Is the summary faithful to SHAP values, or does it introduce hallucinated risk reasoning? |
+| `tabular_scoring_node` | XGBoost fraud score | Label store + SHAP | Covered — not in scope here |
+| `risk_scoring_node` | XGBoost risk score | Override rate + SHAP | Covered — not in scope here |
+| MCP tool nodes | Structured data results | `INCONCLUSIVE` error flag | Covered by MCP error contract — not in scope here |
+
+**Three-tier evaluation stack:**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  PRODUCTION MONITORING — Arize Phoenix (self-hosted)         │
+│  Embedding drift · output distribution · latency p95         │
+│  Hallucination rate trend · token cost per node              │
+├──────────────────────────────────────────────────────────────┤
+│  OFFLINE EVALUATION — Braintrust                             │
+│  Golden-set regression · prompt change gating                │
+│  Ground truth from feedback_node label store                 │
+├──────────────────────────────────────────────────────────────┤
+│  TRACING — LangSmith                                         │
+│  Per-run prompt + response + token count + latency           │
+│  Node execution path · LCEL chain intermediate steps         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Each tier answers a different question:
+- **LangSmith:** What did the LLM do on this specific run?
+- **Braintrust:** Does the current prompt/model pass the regression suite before deploy?
+- **Arize Phoenix:** Is LLM behavior shifting in production over time?
+
+---
+
+### 14b. Tracing — LangSmith
+
+LangGraph emits traces to LangSmith via the `LANGCHAIN_TRACING_V2` environment variable.
+No code changes to graph nodes are required — all LLM calls, LCEL chain steps, and
+node execution are captured automatically.
+
+**Environment variables (added to `.env` / deployment config):**
+
+```bash
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=...                     # from LangSmith project settings
+LANGCHAIN_PROJECT=fnol-claims-agent       # one project per agent service
+```
+
+**Per-agent LangSmith project mapping:**
+
+| Agent Service | LangSmith Project |
+|---|---|
+| `fnol-claims-agent` | `fnol-claims-agent` |
+| `underwriting-quote-agent` | `underwriting-quote-agent` |
+| `doc-verification-agent` | `doc-verification-agent` |
+| `subrogation-agent` | `subrogation-agent` |
+
+**What LangSmith captures automatically:**
+
+| Signal | Source | LangSmith Field |
+|---|---|---|
+| Full prompt sent to LLM | `ChatPromptTemplate` render | `inputs.messages` |
+| Raw LLM response | `BaseChatModel` output | `outputs.generations` |
+| Parsed output | `PydanticOutputParser` | `outputs.output` |
+| Token count (prompt + completion) | LLM response metadata | `token_usage` |
+| Latency per node | Node start/end timestamps | `latency_ms` |
+| LCEL chain intermediate steps | `quote_gen_node` retriever → prompt → llm → parser | `child_runs` |
+| Node execution order | LangGraph run metadata | `tags` / `metadata` |
+
+**Tagging runs with claim context (no PII):**
+
+```python
+from langchain_core.runnables import RunnableConfig
+
+config = RunnableConfig(
+    tags=["fnol", "narrative_llm"],
+    metadata={
+        "claim_id": state["claim_id"],         # opaque ID — not claimant PII
+        "risk_tier": state["risk_tier"],
+        "sync_fraud_score": state["sync_fraud_score"],
+    }
+)
+result = chain.invoke(inputs, config=config)
+```
+
+`claim_id` is the only identifier logged. Never log `claimant_id`, names, addresses,
+or narrative text verbatim to LangSmith — pass the structured metadata only.
+
+**Design decisions:**
+- LangSmith is the first tracing integration because it requires zero instrumentation
+  changes to graph nodes — the LangChain callback system handles it automatically.
+- One LangSmith project per agent service. This keeps FNOL traces separate from
+  underwriting traces, matching the checkpoint store namespace convention.
+- LangSmith is used for debugging and run-level inspection. It is not the production
+  monitoring layer — Arize Phoenix handles drift and distribution tracking (§14d).
+
+---
+
+### 14c. Offline Evaluation — Braintrust
+
+Braintrust manages eval datasets and scoring runs. It is the gating layer for prompt
+changes before deployment: a failing Braintrust suite blocks the deploy, the same way
+a failing unit test suite does.
+
+**Three eval datasets, one per LLM node:**
+
+#### Dataset 1 — `narrative_consistency_evals`
+
+Ground truth source: `feedback_node` label store. When an investigator confirms a
+fraud ring (`investigator_decision = CONFIRM`), the associated `narrative_llm_node`
+output that flagged the inconsistency is a true positive. When an investigator clears
+(`investigator_decision = CLEAR`), a prior FLAG from the narrative node is a false positive.
+
+```python
+import braintrust
+from braintrust import Eval
+
+def narrative_verdict_match(output, expected) -> float:
+    # 1.0 if LLM verdict matches investigator ground truth, 0.0 otherwise
+    llm_verdict = output["narrative_verdict"]          # CONSISTENT / INCONSISTENT
+    investigator_outcome = expected["investigator_decision"]  # CONFIRM / CLEAR
+    if investigator_outcome == "CONFIRM" and llm_verdict == "INCONSISTENT":
+        return 1.0
+    if investigator_outcome == "CLEAR" and llm_verdict == "CONSISTENT":
+        return 1.0
+    return 0.0
+
+Eval(
+    "narrative-consistency-eval",
+    data=lambda: load_labeled_narrative_cases(),    # from label store, PII-masked
+    task=lambda input: run_narrative_llm_node(input),
+    scores=[narrative_verdict_match],
+)
+```
+
+#### Dataset 2 — `quote_explanation_evals`
+
+Scoring function: RAG faithfulness — does the explanation cite terms that exist in
+the retrieved policy documents? Uses an LLM-as-judge scorer with a rubric prompt.
+
+```python
+from braintrust.scorers import LLMClassifier
+
+quote_faithfulness = LLMClassifier(
+    name="QuoteExplanationFaithfulness",
+    prompt_template="""
+You are evaluating whether a quote explanation is faithful to the policy terms provided.
+
+Policy terms retrieved: {{retrieved_docs}}
+Quote explanation generated: {{output}}
+Risk score: {{risk_score}}
+Premium (USD): {{premium_usd}}
+
+Does the explanation accurately reflect the retrieved policy terms without introducing
+facts not present in the retrieval context? Answer YES or NO with a one-sentence reason.
+""",
+    choice_scores={"YES": 1.0, "NO": 0.0},
+)
+```
+
+#### Dataset 3 — `copilot_summary_evals`
+
+Scoring function: SHAP faithfulness — does the investigator copilot summary correctly
+identify the top-3 SHAP features by rank? Rule-based, no LLM judge needed.
+
+```python
+def shap_rank_faithfulness(output, expected) -> float:
+    # Check top-3 SHAP features appear in copilot summary (order-insensitive)
+    top_shap_features = set(expected["shap_top3_features"])
+    summary_text = output["case_summary"].lower()
+    mentioned = sum(1 for f in top_shap_features if f.lower() in summary_text)
+    return mentioned / len(top_shap_features)
+```
+
+**CI integration — block deploy on regression:**
+
+```yaml
+# .github/workflows/eval.yml (or equivalent CI config)
+- name: Run Braintrust evals
+  run: |
+    braintrust eval src/agents/evals/narrative_eval.py \
+                     src/agents/evals/quote_eval.py \
+                     src/agents/evals/copilot_eval.py \
+      --threshold 0.85        # fail CI if any suite scores below 0.85
+  env:
+    BRAINTRUST_API_KEY: ${{ secrets.BRAINTRUST_API_KEY }}
+```
+
+**Eval suite → retraining trigger connection:**
+
+```
+feedback_node label store
+        │
+        ▼ (nightly export job, PII-masked)
+Braintrust dataset — narrative_consistency_evals
+        │
+        ▼ (eval run on prompt/model change)
+narrative_verdict_match score
+        │
+  score drops below 0.85?
+        │
+   YES ─┴─ NO
+    │          │
+    ▼          ▼
+flag for    no action
+prompt
+review
+```
+
+**Design decisions:**
+- Braintrust eval datasets are built from the existing `feedback_node` label store —
+  no additional human labeling pipeline is required to bootstrap. Investigator and
+  underwriter decisions are the ground truth.
+- PII masking runs as a transformation step in the nightly export job before any
+  case data reaches Braintrust. The export job is the single PII boundary — claim
+  narratives are replaced with tokenized placeholders keyed to `claim_id`.
+- LLM-as-judge is used only for `quote_gen_node` faithfulness, where a rubric is
+  required. The other two nodes use rule-based scorers to avoid eval-on-eval
+  cost and latency.
+
+---
+
+### 14d. Production Monitoring — Arize Phoenix
+
+Arize Phoenix (open-source, self-hosted) instruments the LLM nodes via OpenTelemetry.
+It tracks output distribution, embedding drift, and hallucination rate trend in production.
+Self-hosted Phoenix is required — claim narratives cannot leave the deployment boundary
+even masked, as re-identification risk under CCPA/HIPAA adjacent insurance regulations
+is non-trivial.
+
+**Instrumentation (one call at service startup):**
+
+```python
+import phoenix as px
+from openinference.instrumentation.langchain import LangChainInstrumentor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+# Phoenix collector — runs as a sidecar container in the same pod
+exporter = OTLPSpanExporter(endpoint="http://localhost:4317")
+LangChainInstrumentor().instrument(
+    tracer_provider=...,         # configured with exporter above
+    skip_dep_check=True,
+)
+```
+
+Phoenix is deployed as a **sidecar container** in each agent pod — not a shared
+service. This keeps telemetry within the pod boundary until aggregation is required.
+
+**Deployment mapping:**
+
+| Agent | Phoenix Sidecar | Aggregation |
+|---|---|---|
+| `fnol-claims-agent` | Phoenix container in same pod | Phoenix UI (internal ingress) |
+| `underwriting-quote-agent` | Phoenix container in same pod | Phoenix UI (internal ingress) |
+| `doc-verification-agent` | Phoenix container in same pod | Phoenix UI (internal ingress) |
+| `subrogation-agent` | Phoenix container in same pod | Phoenix UI (internal ingress) |
+
+**Metrics tracked per LLM node:**
+
+| Metric | Node | Alert Threshold |
+|---|---|---|
+| `narrative_llm.flag_rate` | `narrative_llm_node` | >3σ shift over 7-day baseline |
+| `narrative_llm.latency_p95_ms` | `narrative_llm_node` | >5000ms (budget: 2–10s) |
+| `quote_gen.hallucination_score` | `quote_gen_node` | Mean > 0.15 (LLM-judge estimate) |
+| `quote_gen.latency_p95_ms` | `quote_gen_node` | >10000ms (budget: 2–8s) |
+| `copilot.token_cost_usd` | `investigator_copilot_node` | >$0.05 per invocation (cost guard) |
+| `copilot.shap_feature_recall` | `investigator_copilot_node` | <0.80 (from Braintrust metric exported) |
+
+**Embedding drift detection for `narrative_llm_node`:**
+
+```python
+# Emit claim narrative embedding alongside each LLM trace
+# Embedding is computed from the anonymized narrative — not the raw text
+# Phoenix tracks centroid drift over rolling 7-day window
+
+px.log_embedding(
+    embedding=narrative_embedding,      # computed from masked narrative
+    raw_data=None,                      # raw text never logged
+    link_to_data=state["claim_id"],
+)
+```
+
+If the incoming narrative embedding distribution shifts significantly (e.g., a new
+fraud pattern emerges with distinct linguistic structure), Phoenix raises a drift alert
+before the Braintrust eval suite would catch it — giving lead time to build new
+eval cases.
+
+**Design decisions:**
+- Phoenix over Arize AI cloud: Insurance data with PII-adjacent content cannot
+  leave the deployment boundary even masked. Self-hosted Phoenix eliminates the
+  data-egress compliance question entirely.
+- Sidecar deployment over a shared Phoenix service: Avoids cross-agent trace
+  commingling and makes pod-level decommission straightforward.
+- Embedding drift monitoring on `narrative_llm_node` specifically because claim
+  narratives are the highest-variance free-text input in the system. Quote
+  explanations and copilot summaries are generated from structured inputs and
+  are less susceptible to distribution shift.
+
+---
+
+### 14e. Feedback Signal → Eval Pipeline
+
+The full pipeline connecting HITL decisions back to the eval and monitoring layers:
+
+```
+FNOL graph — feedback_node
+        │
+        │  investigator_decision written to label store
+        │  (CONFIRM / CLEAR / ESCALATE + claim_id)
+        ▼
+┌───────────────────────────────────┐
+│  label store (PostgreSQL)         │
+│  claim_id, investigator_decision  │
+│  narrative_llm_output (masked)    │
+│  shap_values, sync_fraud_score    │
+└────────────┬──────────────────────┘
+             │
+    nightly export job (PII masking runs here)
+             │
+      ┌──────┴──────────────────────────┐
+      ▼                                 ▼
+Braintrust dataset               Arize Phoenix
+(offline eval — regression        (online monitor —
+ gating on deploy)                 drift + distribution)
+      │                                 │
+      ▼                                 ▼
+CI eval gate                     Alert → Slack / PagerDuty
+(blocks deploy if                (triggers prompt review
+ score < 0.85)                    or model health check)
+```
+
+**Retraining eligibility check — extended:**
+
+The `feedback_node` currently triggers a retraining eligibility check for the
+XGBoost tabular model. Extend this to include LLM eval signal:
+
+```python
+def feedback_node(state: FNOLState) -> FNOLState:
+    # Existing: write decision to label store
+    label_store.write(
+        claim_id=state["claim_id"],
+        investigator_decision=state["investigator_decision"],
+        shap_values=state["shap_values"],
+        sync_fraud_score=state["sync_fraud_score"],
+    )
+
+    # Existing: trigger tabular model retraining eligibility check
+    check_retraining_eligibility(state["claim_id"])
+
+    # Extended: tag narrative LLM output with ground truth for Braintrust export
+    label_store.write_llm_label(
+        claim_id=state["claim_id"],
+        node="narrative_llm_node",
+        llm_output=state.get("narrative_analysis"),        # stored in state by narrative node
+        ground_truth=state["investigator_decision"],
+    )
+
+    return state
+```
+
+The `write_llm_label` call writes to the same PostgreSQL label store — the nightly
+export job picks it up, applies PII masking, and pushes to Braintrust.
+
+**Design decisions:**
+- The nightly export job is the single PII boundary. Masking is not the responsibility
+  of `feedback_node` or any graph node — it runs as a separate offline process on
+  the label store records. This prevents masking logic from leaking into the graph.
+- `narrative_analysis` is stored in `FNOLState` by `narrative_llm_node` today via
+  the `messages` field. If the node is updated to write a structured field
+  (e.g., `narrative_analysis: NarrativeAnalysisResult`), the `feedback_node` call
+  above reads from that field directly. The label write is a no-op if the field is absent.
+- Do not implement eval logging inside graph nodes. Nodes are pure orchestration units —
+  telemetry is the responsibility of the instrumentation layer (LangSmith callbacks,
+  Phoenix OpenTelemetry) and the export job, not the node implementation.
+
+---
+
+### 14f. Framework Selection Summary
+
+| Layer | Primary | Alternative | Why Primary |
+|---|---|---|---|
+| Tracing | LangSmith | LangFuse (open-source) | Native LangGraph integration; zero code changes |
+| Offline eval | Braintrust | W&B Weave | Dataset versioning + CI gate + LLM-judge scoring in one tool |
+| Production monitoring | Arize Phoenix (self-hosted) | Arize AI cloud (if PII controls confirmed) | Self-hosted required for insurance data boundary compliance |
+| LLM-as-judge scorer | Claude (via Bedrock / Azure OpenAI) | GPT-4o | Reuses the same LLM factory from §8; no additional provider dependency |
+
+**What is intentionally excluded:**
+
+| Tool | Exclusion Reason |
+|---|---|
+| LangSmith as production monitor | LangSmith is a run-level debugger, not a time-series drift monitor. Use Phoenix for distribution tracking. |
+| Helicone / PromptLayer | Proxy-based interceptors break LangGraph's async streaming guarantees. |
+| Weights & Biases (W&B) ML monitoring | W&B is the right tool for XGBoost model tracking (already in scope for the tabular layer). Do not conflate ML model monitoring with LLM eval — they are separate pipelines with separate toolchains. |
 
 ---
 
